@@ -4,16 +4,16 @@ lookback_days: 300
 min_history_days: 90
 
 scoring:
-  rsi_oversold: 45
-  volume_spike: 1.15
-  pe_max: 55
-  pb_max: 8
-  roe_min: 0.08
-  min_avg_volume: 150000
-  max_atr_pct: 7.5
+  rsi_oversold: 55
+  volume_spike: 1.05
+  pe_max: 100
+  pb_max: 15
+  roe_min: 0.01
+  min_avg_volume: 50000
+  max_atr_pct: 12.0
   weights:
-    technical: 0.70
-    fundamental: 0.30
+    technical: 0.8
+    fundamental: 0.2
 
 model:
   n_estimators: 160
