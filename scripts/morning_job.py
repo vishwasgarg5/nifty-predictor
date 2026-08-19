@@ -134,51 +134,46 @@ def main():
         logger.info(f"Predictions saved → {pred_file}")
 
         # --------------------------------------------------
-        # 7. Build & Send Telegram Message
+        # 7. Build clean Telegram Message
         # --------------------------------------------------
         lines = [
-            f"*Top 5 Stocks + Predictions + Sentiment*",
+            f"*TOP 5 STOCK PREDICTIONS*",
             f"Date: `{today_str}`",
             f"Universe: `{cfg.universe.upper()}`",
-            ""
+            "",
+            "```",
+            f"{'Stock':<12} {'Open':>8} {'High':>8} {'Low':>8} {'Close':>8}",
+            "-" * 48
         ]
 
         for _, row in top5_df.iterrows():
             symbol = row["symbol"]
-            clean_symbol = symbol.replace(".NS", "")
+            clean = symbol.replace(".NS", "")
             pred = predictions.get(symbol)
-            sent = sentiments.get(symbol)
 
             if not pred:
                 continue
 
-            lines.append(f"*{clean_symbol}*  |  Score: `{row['score']}`")
             lines.append(
-                f"Pred → O:`{pred['Open']}`  H:`{pred['High']}`  "
-                f"L:`{pred['Low']}`  C:`{pred['Close']}`"
+                f"{clean:<12} {pred['Open']:>8.2f} {pred['High']:>8.2f} "
+                f"{pred['Low']:>8.2f} {pred['Close']:>8.2f}"
             )
+
+        lines.append("```")
+        lines.append("")
+
+        # Optional: Add short sentiment summary
+        lines.append("*Sentiment Summary*")
+        for _, row in top5_df.iterrows():
+            symbol = row["symbol"]
+            clean = symbol.replace(".NS", "")
+            sent = sentiments.get(symbol)
 
             if sent and sent.article_count > 0:
                 emoji = "🟢" if sent.overall_score >= 0.15 else "🔴" if sent.overall_score <= -0.15 else "⚪"
+                lines.append(f"{emoji} {clean}: `{sent.overall_score:+.2f}` ({sent.overall_label})")
 
-                lines.append(
-                    f"{emoji} Sentiment: `{sent.overall_score:+.2f}` "
-                    f"({sent.overall_label}) [{sent.method}]"
-                )
-
-                # Show top 2 strongest headlines
-                sorted_headlines = sorted(
-                    sent.headlines,
-                    key=lambda x: abs(x[1]),
-                    reverse=True
-                )[:2]
-
-                for title, score in sorted_headlines:
-                    short_title = (title[:62] + "...") if len(title) > 65 else title
-                    lines.append(f"  • {short_title} (`{score:+.2f}`)")
-
-            lines.append("")  # empty line between stocks
-
+        lines.append("")
         lines.append(f"_Job finished in {(datetime.now() - start_time).seconds}s_")
 
         message = "\n".join(lines)
