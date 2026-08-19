@@ -103,4 +103,86 @@ def main():
                     f"Pred C: `{pred_close:.2f}` → Actual C: `{actual_close:.2f}`"
                 )
                 lines.append(
-                    f
+                    f"Diff: `{diff:+.2f}`  (`{pct_error:+.2f}%`)"
+                )
+                lines.append("")
+
+                error_rows.append({
+                    "date": today_str,
+                    "symbol": symbol,
+                    "pred_open": row.get("Open"),
+                    "pred_high": row.get("High"),
+                    "pred_low": row.get("Low"),
+                    "pred_close": pred_close,
+                    "actual_close": actual_close,
+                    "abs_error": abs(diff),
+                    "abs_error_pct": abs_pct,
+                    "direction_correct": direction_correct
+                })
+
+                success_count += 1
+
+                # --------------------------------------------------
+                # 4. Light retrain with latest data
+                # --------------------------------------------------
+                try:
+                    predictor = OHLCPredictor(symbol)
+                    predictor.train()
+                    logger.info(f"Model updated for {symbol}")
+                except Exception as e:
+                    logger.warning(f"Retrain failed for {symbol}: {e}")
+
+            except Exception as e:
+                logger.error(f"Error processing {symbol}: {e}")
+                lines.append(f"*{clean_symbol}* → Error fetching actual data\n")
+
+        if success_count == 0:
+            send_telegram(f"⚠️ Evening Job: Could not fetch actual data for any stock on `{today_str}`")
+            return
+
+        # --------------------------------------------------
+        # 5. Save error history
+        # --------------------------------------------------
+        err_path = Path(cfg.paths.errors_file)
+        err_path.parent.mkdir(parents=True, exist_ok=True)
+
+        err_df = pd.DataFrame(error_rows)
+
+        if err_path.exists():
+            err_df.to_csv(err_path, mode="a", header=False, index=False)
+        else:
+            err_df.to_csv(err_path, index=False)
+
+        logger.info(f"Error history updated → {err_path}")
+
+        # --------------------------------------------------
+        # 6. Summary line
+        # --------------------------------------------------
+        avg_error = err_df["abs_error_pct"].mean()
+        lines.append(f"*Summary*")
+        lines.append(f"Stocks processed: `{success_count}`")
+        lines.append(f"Average Absolute Error: `{avg_error:.2f}%`")
+        lines.append(f"_Job finished in {(datetime.now() - start_time).seconds}s_")
+
+        # --------------------------------------------------
+        # 7. Send Telegram
+        # --------------------------------------------------
+        message = "\n".join(lines)
+        success = send_telegram(message)
+
+        if success:
+            logger.info("Evening report sent successfully")
+        else:
+            logger.error("Failed to send Telegram message")
+
+    except Exception as e:
+        error_msg = f"❌ *Evening Job Failed*\n`{today_str}`\n\n```{str(e)[:800]}```"
+        logger.error(traceback.format_exc())
+        send_telegram(error_msg)
+
+    logger.info("Evening Job finished")
+    logger.info("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
