@@ -133,6 +133,7 @@ def compute_stock_score(symbol: str) -> dict | None:
 def select_top5(symbols: list, top_n: int = 5) -> pd.DataFrame:
     """
     Score all symbols and return the top N.
+    If no stock passes the filters, use an emergency fallback selection.
     """
     results = []
     logger.info(f"Starting scoring of {len(symbols)} symbols...")
@@ -145,15 +146,50 @@ def select_top5(symbols: list, top_n: int = 5) -> pd.DataFrame:
 
     logger.info(f"Total stocks that passed filters: {len(results)}")
 
-    if not results:
-        logger.warning("No stocks passed the filters!")
+    # -------------------------------------------------
+    # Normal case – we have some stocks
+    # -------------------------------------------------
+    if results:
+        df = pd.DataFrame(results)
+        df = df.sort_values("score", ascending=False).head(top_n).reset_index(drop=True)
+
+        logger.info("Top selected stocks:")
+        for _, row in df.iterrows():
+            logger.info(f"  {row['symbol']} → Score: {row['score']}")
+
+        return df
+
+    # -------------------------------------------------
+    # Emergency Fallback – no stock passed filters
+    # -------------------------------------------------
+    logger.warning("No stocks passed filters — activating emergency fallback selection")
+
+    emergency = []
+    for sym in symbols[:15]:          # try first 15 symbols
+        try:
+            hist = download_history(sym, period="3mo")
+            if hist is not None and len(hist) > 30:
+                last_close = float(hist["Close"].iloc[-1])
+                emergency.append({
+                    "symbol": sym,
+                    "score": 5.0,                    # neutral score
+                    "close": round(last_close, 2),
+                    "rsi": 50.0,
+                    "atr_pct": 2.5,
+                    "pe": None,
+                    "volume": None
+                })
+                logger.info(f"Emergency selected: {sym}")
+
+                if len(emergency) >= top_n:
+                    break
+        except Exception as e:
+            logger.warning(f"Emergency selection failed for {sym}: {e}")
+
+    if not emergency:
+        logger.error("Even emergency fallback failed – returning empty DataFrame")
         return pd.DataFrame()
 
-    df = pd.DataFrame(results)
-    df = df.sort_values("score", ascending=False).head(top_n).reset_index(drop=True)
-
-    logger.info("Top selected stocks:")
-    for _, row in df.iterrows():
-        logger.info(f"  {row['symbol']} → {row['score']}")
-
+    df = pd.DataFrame(emergency)
+    logger.info(f"Emergency Top {len(df)} stocks selected")
     return df
