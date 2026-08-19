@@ -10,119 +10,87 @@ logger = logging.getLogger(__name__)
 
 
 def compute_stock_score(symbol: str) -> dict | None:
-    """
-    Calculate a composite score for a stock.
-    Returns None if the stock should be rejected.
-    """
     try:
-        # 1. Download price history
         hist = download_history(symbol, period="6mo")
-        if hist is None or len(hist) < 50:
-            logger.info(f"{symbol} → Rejected: insufficient price history")
+        if hist is None or len(hist) < 60:
+            logger.info(f"{symbol} → Rejected: bad/insufficient history")
             return None
 
-        # 2. Create features
-        try:
-            feat = create_features(hist)
-        except Exception as e:
-            logger.warning(f"{symbol} → Feature creation failed: {e}")
-            return None
-
-        if feat.empty or len(feat) < 30:
-            logger.info(f"{symbol} → Rejected: not enough feature rows after dropna")
+        feat = create_features(hist)
+        if feat is None or feat.empty or len(feat) < 30:
+            logger.info(f"{symbol} → Rejected: feature creation failed or too few rows")
             return None
 
         last = feat.iloc[-1]
 
-        # -------------------------------------------------
-        # Technical Score
-        # -------------------------------------------------
+        # ---------- Technical Score (very forgiving) ----------
         tech = 0.0
 
-        # RSI
         rsi = last.get("rsi_14", 50)
-        if rsi < cfg.scoring.rsi_oversold:
-            tech += 1.8
-        elif rsi < 50:
-            tech += 0.9
-        elif rsi > 70:
-            tech -= 0.5   # slightly penalize overbought
+        if pd.isna(rsi):
+            rsi = 50
 
-        # Trend (SMA)
+        if rsi < 40:
+            tech += 1.5
+        elif rsi < 55:
+            tech += 1.0
+        elif rsi > 70:
+            tech += 0.3
+
         if last["Close"] > last.get("sma_20", last["Close"]):
             tech += 1.2
         if last["Close"] > last.get("sma_50", last["Close"]):
             tech += 1.0
 
-        # MACD
-        macd_val = last.get("MACD_12_26_9", 0)
-        macd_signal = last.get("MACDs_12_26_9", 0)
-        if macd_val > macd_signal:
-            tech += 1.0
+        # MACD (safe access)
+        macd_col = next((c for c in feat.columns if "MACD_12_26_9" in str(c)), None)
+        signal_col = next((c for c in feat.columns if "MACDs_12_26_9" in str(c)), None)
 
-        # Volume spike
+        if macd_col and signal_col:
+            if last[macd_col] > last[signal_col]:
+                tech += 1.0
+
         vol_ratio = last.get("vol_ratio", 1.0)
-        if vol_ratio > cfg.scoring.volume_spike:
-            tech += 1.0
+        if not pd.isna(vol_ratio) and vol_ratio > 1.1:
+            tech += 0.8
 
-        # -------------------------------------------------
-        # Risk Filters (soft)
-        # -------------------------------------------------
-        atr_pct = last.get("atr_pct", 0)
-        if atr_pct > cfg.scoring.max_atr_pct:
-            logger.info(f"{symbol} → Rejected: high ATR {atr_pct:.2f}% > {cfg.scoring.max_atr_pct}%")
+        # ---------- Soft Risk Filter ----------
+        atr_pct = last.get("atr_pct", 3.0)
+        if pd.isna(atr_pct):
+            atr_pct = 3.0
+
+        if atr_pct > 10.0:          # only reject extremely volatile stocks
+            logger.info(f"{symbol} → Rejected: extreme ATR {atr_pct:.2f}%")
             return None
 
-        # -------------------------------------------------
-        # Fundamental Score (soft – don’t reject easily)
-        # -------------------------------------------------
+        # ---------- Fundamental (bonus only) ----------
         fund = 0.0
-        pe = pb = roe = avg_vol = None
-
         try:
             info = yf.Ticker(symbol).info
             pe = info.get("trailingPE") or info.get("forwardPE")
             pb = info.get("priceToBook")
             roe = info.get("returnOnEquity")
-            avg_vol = info.get("averageVolume") or info.get("averageDailyVolume10Day")
 
-            if pe is not None and 0 < pe < cfg.scoring.pe_max:
-                fund += 1.2
-            if pb is not None and 0 < pb < cfg.scoring.pb_max:
+            if pe and 0 < pe < 50:
                 fund += 1.0
-            if roe is not None and roe > cfg.scoring.roe_min:
-                fund += 1.3
+            if pb and 0 < pb < 8:
+                fund += 0.8
+            if roe and roe > 0.10:
+                fund += 1.0
+        except Exception:
+            pass
 
-            # Soft volume filter
-            if avg_vol is not None and avg_vol < cfg.scoring.min_avg_volume:
-                logger.info(f"{symbol} → Rejected: low volume {avg_vol:,.0f}")
-                return None
-
-        except Exception as e:
-            logger.debug(f"{symbol} → Fundamental data incomplete: {e}")
-
-        # -------------------------------------------------
-        # Final Score
-        # -------------------------------------------------
-        total = (
-            tech * cfg.scoring.weights.technical +
-            fund * cfg.scoring.weights.fundamental
-        )
+        total = tech * 0.75 + fund * 0.25
 
         result = {
             "symbol": symbol,
             "score": round(total, 2),
             "close": round(float(last["Close"]), 2),
             "rsi": round(float(rsi), 1),
-            "atr_pct": round(float(atr_pct), 2),
-            "pe": pe,
-            "volume": avg_vol
+            "atr_pct": round(float(atr_pct), 2)
         }
 
-        logger.info(
-            f"{symbol} → ACCEPTED | Score: {total:.2f} | "
-            f"Tech: {tech:.1f} | Fund: {fund:.1f} | RSI: {rsi:.1f}"
-        )
+        logger.info(f"{symbol} → ACCEPTED | Score: {total:.2f} | RSI: {rsi:.1f}")
         return result
 
     except Exception as e:
