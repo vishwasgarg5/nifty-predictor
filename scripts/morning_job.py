@@ -94,7 +94,10 @@ def main():
 
         for symbol in predictions.keys():
             try:
-                sent = sentiment_engine.analyze_stock(symbol, max_articles=cfg.sentiment.max_articles)
+                sent = sentiment_engine.analyze_stock(
+                    symbol, 
+                    max_articles=cfg.sentiment.max_articles
+                )
                 sentiments[symbol] = sent
                 logger.info(f"{symbol} sentiment: {sent.overall_score:+.2f} ({sent.overall_label})")
             except Exception as e:
@@ -109,6 +112,7 @@ def main():
 
         records = []
         for symbol, pred in predictions.items():
+            score_val = top5_df.loc[top5_df["symbol"] == symbol, "score"].values
             records.append({
                 "date": today_str,
                 "symbol": symbol,
@@ -116,7 +120,7 @@ def main():
                 "High": pred["High"],
                 "Low": pred["Low"],
                 "Close": pred["Close"],
-                "score": top5_df.loc[top5_df["symbol"] == symbol, "score"].values[0]
+                "score": float(score_val[0]) if len(score_val) > 0 else 0.0
             })
 
         pred_df = pd.DataFrame(records)
@@ -151,6 +155,43 @@ def main():
 
             if sent and sent.article_count > 0:
                 emoji = "🟢" if sent.overall_score >= 0.15 else "🔴" if sent.overall_score <= -0.15 else "⚪"
+
                 lines.append(
                     f"{emoji} Sentiment: `{sent.overall_score:+.2f}` "
-                    f"({sent
+                    f"({sent.overall_label}) [{sent.method}]"
+                )
+
+                # Show top 2 strongest headlines
+                sorted_headlines = sorted(
+                    sent.headlines,
+                    key=lambda x: abs(x[1]),
+                    reverse=True
+                )[:2]
+
+                for title, score in sorted_headlines:
+                    short_title = (title[:62] + "...") if len(title) > 65 else title
+                    lines.append(f"  • {short_title} (`{score:+.2f}`)")
+
+            lines.append("")  # empty line between stocks
+
+        lines.append(f"_Job finished in {(datetime.now() - start_time).seconds}s_")
+
+        message = "\n".join(lines)
+        success = send_telegram(message)
+
+        if success:
+            logger.info("Telegram message sent successfully")
+        else:
+            logger.error("Failed to send Telegram message")
+
+    except Exception as e:
+        error_msg = f"❌ *Morning Job Failed*\n`{today_str}`\n\n```{str(e)[:800]}```"
+        logger.error(traceback.format_exc())
+        send_telegram(error_msg)
+
+    logger.info("Morning Job finished")
+    logger.info("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
