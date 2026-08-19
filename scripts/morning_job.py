@@ -1,66 +1,156 @@
+#!/usr/bin/env python3
+"""
+Morning Job - Top 5 Selection + OHLC Prediction + FinBERT Sentiment
+Runs every trading day ~08:45 IST
+"""
+
 import logging
 import pandas as pd
 from datetime import datetime
 from pathlib import Path
+import traceback
+
 from src.config import cfg
 from src.holidays import is_trading_day
-from src.data_loader import get_universe_symbols, download_history
-from src.telegram_utils import send_telegram
-from src.sentiment import get_sentiment_engine
+from src.data_loader import get_universe_symbols
 from src.scoring import select_top5
 from src.model import OHLCPredictor
+from src.sentiment import get_sentiment_engine
+from src.telegram_utils import send_telegram
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+# --------------------------------------------------
+# Logging
+# --------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
 logger = logging.getLogger(__name__)
 
+
 def main():
+    start_time = datetime.now()
+    today_str = start_time.strftime("%Y-%m-%d")
+    logger.info("=" * 60)
+    logger.info(f"Morning Job started | {today_str}")
+
+    # --------------------------------------------------
+    # 1. Holiday / Weekend check
+    # --------------------------------------------------
     if not is_trading_day():
-        logger.info("Not a trading day. Exiting.")
+        logger.info("Today is not a trading day. Exiting cleanly.")
         return
 
-    logger.info("=== Morning Job Started ===")
-    today = datetime.now().strftime("%Y-%m-%d")
+    try:
+        # --------------------------------------------------
+        # 2. Get universe
+        # --------------------------------------------------
+        symbols = get_universe_symbols()
+        logger.info(f"Universe loaded: {len(symbols)} symbols")
 
-    symbols = get_universe_symbols()
-    logger.info(f"Universe size: {len(symbols)}")
+        # --------------------------------------------------
+        # 3. Select Top 5
+        # --------------------------------------------------
+        logger.info("Scoring stocks and selecting Top 5...")
+        top5_df = select_top5(symbols, top_n=cfg.top_n)
 
-    symbols = get_universe_symbols()
-    top5_df = select_top5(symbols, top_n=cfg.top_n)
-    
-    predictions = {}
-    for _, row in top5_df.iterrows():
-        pred = OHLCPredictor(row["symbol"])
-        predictions[row["symbol"]] = pred.predict_next()
-    # In real use, replace with actual select_top5 + OHLCPredictor
-    top5 = [
-        {"symbol": "RELIANCE.NS", "score": 8.4},
-        {"symbol": "TCS.NS", "score": 7.9},
-        {"symbol": "HDFCBANK.NS", "score": 7.6},
-        {"symbol": "INFY.NS", "score": 7.2},
-        {"symbol": "ICICIBANK.NS", "score": 7.0},
-    ]
+        if top5_df.empty:
+            send_telegram(f"⚠️ Morning Job: No stocks passed filters on {today_str}")
+            logger.error("No stocks selected")
+            return
 
-    engine = get_sentiment_engine()
-    sentiments = {}
-    for s in top5:
-        sentiments[s["symbol"]] = engine.analyze_stock(s["symbol"])
+        logger.info(f"Top 5 selected:\n{top5_df[['symbol', 'score']].to_string(index=False)}")
 
-    # Build message
-    lines = [f"*Top 5 Predictions + Sentiment* ({today})\n"]
-    for item in top5:
-        sym = item["symbol"]
-        sent = sentiments.get(sym)
-        lines.append(f"*{sym.replace('.NS','')}*  Score: {item['score']}")
-        lines.append(f"Pred → O: —  H: —  L: —  C: —")  # replace with real preds
-        if sent and sent.article_count > 0:
-            emoji = "🟢" if sent.overall_score > 0.15 else "🔴" if sent.overall_score < -0.15 else "⚪"
-            lines.append(f"{emoji} Sentiment: {sent.overall_score:+.2f} ({sent.overall_label}) [{sent.method}]")
-            for title, sc in sent.headlines[:2]:
-                lines.append(f"  • {title[:65]}... ({sc:+.2f})")
-        lines.append("")
+        # --------------------------------------------------
+        # 4. Predict OHLC for each stock
+        # --------------------------------------------------
+        predictions = {}
+        logger.info("Running OHLC predictions...")
 
-    send_telegram("\n".join(lines))
-    logger.info("Morning job completed")
+        for _, row in top5_df.iterrows():
+            symbol = row["symbol"]
+            try:
+                predictor = OHLCPredictor(symbol)
+                pred = predictor.predict_next()
+                if pred:
+                    predictions[symbol] = pred
+                    logger.info(f"{symbol} → C: {pred['Close']}")
+                else:
+                    logger.warning(f"Prediction failed for {symbol}")
+            except Exception as e:
+                logger.error(f"Prediction error {symbol}: {e}")
 
-if __name__ == "__main__":
-    main()
+        if not predictions:
+            send_telegram(f"⚠️ Morning Job: All predictions failed on {today_str}")
+            return
+
+        # --------------------------------------------------
+        # 5. Sentiment Analysis (FinBERT + fallback)
+        # --------------------------------------------------
+        logger.info("Running sentiment analysis...")
+        sentiment_engine = get_sentiment_engine()
+        sentiments = {}
+
+        for symbol in predictions.keys():
+            try:
+                sent = sentiment_engine.analyze_stock(symbol, max_articles=cfg.sentiment.max_articles)
+                sentiments[symbol] = sent
+                logger.info(f"{symbol} sentiment: {sent.overall_score:+.2f} ({sent.overall_label})")
+            except Exception as e:
+                logger.error(f"Sentiment failed for {symbol}: {e}")
+                sentiments[symbol] = None
+
+        # --------------------------------------------------
+        # 6. Save predictions (for evening job)
+        # --------------------------------------------------
+        pred_dir = Path(cfg.paths.predictions)
+        pred_dir.mkdir(parents=True, exist_ok=True)
+
+        records = []
+        for symbol, pred in predictions.items():
+            records.append({
+                "date": today_str,
+                "symbol": symbol,
+                "Open": pred["Open"],
+                "High": pred["High"],
+                "Low": pred["Low"],
+                "Close": pred["Close"],
+                "score": top5_df.loc[top5_df["symbol"] == symbol, "score"].values[0]
+            })
+
+        pred_df = pd.DataFrame(records)
+        pred_file = pred_dir / f"{today_str}.csv"
+        pred_df.to_csv(pred_file, index=False)
+        logger.info(f"Predictions saved → {pred_file}")
+
+        # --------------------------------------------------
+        # 7. Build & Send Telegram Message
+        # --------------------------------------------------
+        lines = [
+            f"*Top 5 Stocks + Predictions + Sentiment*",
+            f"Date: `{today_str}`",
+            f"Universe: `{cfg.universe.upper()}`",
+            ""
+        ]
+
+        for _, row in top5_df.iterrows():
+            symbol = row["symbol"]
+            clean_symbol = symbol.replace(".NS", "")
+            pred = predictions.get(symbol)
+            sent = sentiments.get(symbol)
+
+            if not pred:
+                continue
+
+            lines.append(f"*{clean_symbol}*  |  Score: `{row['score']}`")
+            lines.append(
+                f"Pred → O:`{pred['Open']}`  H:`{pred['High']}`  "
+                f"L:`{pred['Low']}`  C:`{pred['Close']}`"
+            )
+
+            if sent and sent.article_count > 0:
+                emoji = "🟢" if sent.overall_score >= 0.15 else "🔴" if sent.overall_score <= -0.15 else "⚪"
+                lines.append(
+                    f"{emoji} Sentiment: `{sent.overall_score:+.2f}` "
+                    f"({sent
