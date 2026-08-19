@@ -1,91 +1,106 @@
+#!/usr/bin/env python3
+"""
+Evening Job - Actual vs Predicted + Error Logging + Light Retrain
+Runs every trading day ~16:15 IST
+"""
+
 import logging
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+import traceback
+
 from src.config import cfg
 from src.holidays import is_trading_day
 from src.data_loader import download_history
-from src.telegram_utils import send_telegram
 from src.model import OHLCPredictor
+from src.telegram_utils import send_telegram
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+# --------------------------------------------------
+# Logging
+# --------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
 logger = logging.getLogger(__name__)
 
+
 def main():
+    start_time = datetime.now()
+    today_str = start_time.strftime("%Y-%m-%d")
+    logger.info("=" * 60)
+    logger.info(f"Evening Job started | {today_str}")
+
+    # --------------------------------------------------
+    # 1. Holiday / Weekend check
+    # --------------------------------------------------
     if not is_trading_day():
-        logger.info("Not a trading day. Skipping evening job.")
+        logger.info("Today is not a trading day. Exiting cleanly.")
         return
 
-    logger.info("=== Evening Job Started ===")
-    today = datetime.now().strftime("%Y-%m-%d")
+    try:
+        # --------------------------------------------------
+        # 2. Load today's predictions
+        # --------------------------------------------------
+        pred_dir = Path(cfg.paths.predictions)
+        pred_file = pred_dir / f"{today_str}.csv"
 
-    pred_file = Path(cfg.paths.predictions) / f"{today}.csv"
-    if not pred_file.exists():
-        # Try yesterday in case of delay
-        from datetime import timedelta
-        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-        pred_file = Path(cfg.paths.predictions) / f"{yesterday}.csv"
+        # Fallback to yesterday if today's file is missing
+        if not pred_file.exists():
+            yesterday = (start_time - timedelta(days=1)).strftime("%Y-%m-%d")
+            pred_file = pred_dir / f"{yesterday}.csv"
+            logger.warning(f"Today's prediction file not found. Trying {yesterday}")
 
-    if not pred_file.exists():
-        send_telegram(f"⚠️ No prediction file found for {today}")
-        return
+        if not pred_file.exists():
+            msg = f"⚠️ *Evening Job*: No prediction file found for `{today_str}`"
+            send_telegram(msg)
+            logger.error("No prediction file found")
+            return
 
-    preds = pd.read_csv(pred_file)
-    if "symbol" not in preds.columns:
-        preds = preds.reset_index().rename(columns={"index": "symbol"})
+        preds = pd.read_csv(pred_file)
+        logger.info(f"Loaded predictions from {pred_file.name} | {len(preds)} stocks")
 
-    lines = [f"*Actual vs Predicted* ({today})\n"]
-    error_rows = []
+        # --------------------------------------------------
+        # 3. Compare Actual vs Predicted
+        # --------------------------------------------------
+        lines = [
+            f"*Actual vs Predicted Report*",
+            f"Date: `{today_str}`",
+            ""
+        ]
 
-    for _, row in preds.iterrows():
-        symbol = row["symbol"]
-        try:
-            hist = download_history(symbol, period="5d")
-            if hist is None or len(hist) < 1:
-                continue
+        error_rows = []
+        success_count = 0
 
-            actual = hist.iloc[-1]
-            pred_close = row.get("Close") or row.get("pred_close")
-            actual_close = actual["Close"]
+        for _, row in preds.iterrows():
+            symbol = row["symbol"]
+            clean_symbol = symbol.replace(".NS", "")
 
-            diff = actual_close - pred_close
-            pct = (diff / pred_close) * 100 if pred_close else 0
+            try:
+                hist = download_history(symbol, period="5d")
+                if hist is None or len(hist) < 1:
+                    logger.warning(f"No actual data for {symbol}")
+                    continue
 
-            lines.append(
-                f"*{symbol.replace('.NS', '')}*\n"
-                f"Pred C: `{pred_close:.2f}` → Actual C: `{actual_close:.2f}`\n"
-                f"Diff: `{diff:+.2f}` (`{pct:+.2f}%`)\n"
-            )
+                actual = hist.iloc[-1]
+                pred_close = float(row["Close"])
+                actual_close = float(actual["Close"])
 
-            error_rows.append({
-                "date": today,
-                "symbol": symbol,
-                "pred_close": pred_close,
-                "actual_close": actual_close,
-                "abs_error": abs(diff),
-                "abs_error_pct": abs(pct),
-                "direction_correct": int((pred_close > row.get("prev_close", pred_close)) == 
-                                         (actual_close > row.get("prev_close", actual_close)))
-            })
+                diff = actual_close - pred_close
+                pct_error = (diff / pred_close) * 100 if pred_close != 0 else 0
+                abs_pct = abs(pct_error)
 
-            # Light retrain with new data
-            predictor = OHLCPredictor(symbol)
-            predictor.train()
+                # Direction accuracy (simple)
+                prev_close = float(hist.iloc[-2]["Close"]) if len(hist) >= 2 else pred_close
+                pred_direction = 1 if pred_close > prev_close else 0
+                actual_direction = 1 if actual_close > prev_close else 0
+                direction_correct = int(pred_direction == actual_direction)
 
-        except Exception as e:
-            logger.error(f"Error processing {symbol}: {e}")
-
-    # Save errors
-    err_path = Path(cfg.paths.errors_file)
-    err_path.parent.mkdir(parents=True, exist_ok=True)
-    err_df = pd.DataFrame(error_rows)
-    if err_path.exists():
-        err_df.to_csv(err_path, mode="a", header=False, index=False)
-    else:
-        err_df.to_csv(err_path, index=False)
-
-    send_telegram("\n".join(lines))
-    logger.info("Evening job completed")
-
-if __name__ == "__main__":
-    main()
+                lines.append(f"*{clean_symbol}*")
+                lines.append(
+                    f"Pred C: `{pred_close:.2f}` → Actual C: `{actual_close:.2f}`"
+                )
+                lines.append(
+                    f
