@@ -3,6 +3,11 @@
 Morning Job - Top 5 Selection + OHLC Prediction + FinBERT Sentiment
 Runs every trading day ~08:45 IST
 """
+import sys
+from pathlib import Path
+
+# Add project root to Python path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import logging
 import pandas as pd
