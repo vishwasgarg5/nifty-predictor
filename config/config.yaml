@@ -1,0 +1,35 @@
+universe: "nifty100"          # nifty50 | nifty100 | nifty200
+top_n: 5
+lookback_days: 300
+min_history_days: 90
+
+scoring:
+  rsi_oversold: 38
+  volume_spike: 1.25
+  pe_max: 40
+  pb_max: 7
+  roe_min: 0.10
+  min_avg_volume: 400000
+  max_atr_pct: 5.0
+  weights:
+    technical: 0.65
+    fundamental: 0.35
+
+model:
+  n_estimators: 160
+  max_depth: 5
+  learning_rate: 0.045
+  retrain_every_days: 1
+
+sentiment:
+  max_articles: 7
+  use_finbert: true
+  finbert_timeout: 90
+
+paths:
+  predictions: "data/predictions"
+  history: "data/history"
+  models: "models"
+  nifty_cache: "data/nifty_cache.csv"
+  errors_file: "data/history/daily_errors.csv"
+  weekly_file: "data/history/weekly_reports.csv"
