@@ -1,0 +1,57 @@
+name: Test Telegram Secrets
+
+on:
+  workflow_dispatch:          # Only manual trigger (safe)
+
+jobs:
+  test-telegram:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install requests
+        run: pip install requests
+
+      - name: Test Telegram Message
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python - << 'EOF'
+          import os
+          import requests
+
+          token = os.getenv("TELEGRAM_BOT_TOKEN")
+          chat_id = os.getenv("TELEGRAM_CHAT_ID")
+
+          print("Token exists:", bool(token))
+          print("Chat ID exists:", bool(chat_id))
+
+          if not token or not chat_id:
+              print("❌ Secrets are missing!")
+              exit(1)
+
+          url = f"https://api.telegram.org/bot{token}/sendMessage"
+          payload = {
+              "chat_id": chat_id,
+              "text": "✅ *Telegram Secrets Test Successful!*\n\nYour bot is working correctly from GitHub Actions.",
+              "parse_mode": "Markdown"
+          }
+
+          response = requests.post(url, json=payload, timeout=15)
+          
+          print("Status Code:", response.status_code)
+          print("Response:", response.text)
+
+          if response.status_code == 200:
+              print("✅ Message sent successfully!")
+          else:
+              print("❌ Failed to send message")
+              exit(1)
+          EOF
