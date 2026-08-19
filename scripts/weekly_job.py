@@ -5,6 +5,12 @@ Runs every Saturday ~10:00 IST
 Shows how accurate the model has been over the last trading week.
 """
 
+import sys
+from pathlib import Path
+
+# Add project root to Python path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import logging
 import pandas as pd
 from datetime import datetime, timedelta
