@@ -7,8 +7,8 @@ from src.holidays import is_trading_day
 from src.data_loader import get_universe_symbols, download_history
 from src.telegram_utils import send_telegram
 from src.sentiment import get_sentiment_engine
-# from src.scoring import select_top5
-# from src.model import OHLCPredictor
+from src.scoring import select_top5
+from src.model import OHLCPredictor
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
@@ -24,7 +24,13 @@ def main():
     symbols = get_universe_symbols()
     logger.info(f"Universe size: {len(symbols)}")
 
-    # --- Placeholder for scoring & prediction ---
+    symbols = get_universe_symbols()
+    top5_df = select_top5(symbols, top_n=cfg.top_n)
+    
+    predictions = {}
+    for _, row in top5_df.iterrows():
+        pred = OHLCPredictor(row["symbol"])
+        predictions[row["symbol"]] = pred.predict_next()
     # In real use, replace with actual select_top5 + OHLCPredictor
     top5 = [
         {"symbol": "RELIANCE.NS", "score": 8.4},
