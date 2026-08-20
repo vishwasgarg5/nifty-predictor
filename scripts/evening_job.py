@@ -1,30 +1,26 @@
 #!/usr/bin/env python3
 """
 Evening Job - Actual vs Predicted + Error Logging + Light Retrain
-Improved version with better data fetching and clean table output
+Clean table format + better error handling
 """
 
 import sys
 from pathlib import Path
 
-# Add project root to Python path
+# Fix Python path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import logging
 import pandas as pd
 from datetime import datetime, timedelta
 import traceback
-import time
 
 from src.config import cfg
 from src.holidays import is_trading_day
-from src.data_loader import download_history
+from src.data_loader import download_history, get_actual_close
 from src.model import OHLCPredictor
 from src.telegram_utils import send_telegram
 
-# --------------------------------------------------
-# Logging
-# --------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -33,54 +29,21 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def get_actual_close(symbol: str, retries: int = 4):
-    """Robustly fetch the latest actual close price."""
-    for attempt in range(1, retries + 1):
-        try:
-            df = download_history(symbol, period="5d")
-            if df is None or df.empty:
-                raise ValueError("Empty dataframe")
-
-            # Handle MultiIndex columns
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-
-            if "Close" not in df.columns:
-                raise ValueError("Close column missing")
-
-            actual_close = float(df["Close"].iloc[-1])
-            prev_close = float(df["Close"].iloc[-2]) if len(df) >= 2 else actual_close
-
-            return actual_close, prev_close
-
-        except Exception as e:
-            logger.warning(f"{symbol} actual data attempt {attempt}/{retries} failed: {e}")
-            time.sleep(1.2 * attempt)
-
-    return None, None
-
-
 def main():
     start_time = datetime.now()
     today_str = start_time.strftime("%Y-%m-%d")
     logger.info("=" * 60)
     logger.info(f"Evening Job started | {today_str}")
 
-    # --------------------------------------------------
-    # 1. Holiday check
-    # --------------------------------------------------
     if not is_trading_day():
-        logger.info("Today is not a trading day. Exiting cleanly.")
+        logger.info("Today is not a trading day. Exiting.")
         return
 
     try:
-        # --------------------------------------------------
-        # 2. Load predictions
-        # --------------------------------------------------
         pred_dir = Path(cfg.paths.predictions)
         pred_file = pred_dir / f"{today_str}.csv"
 
-        # Fallback to previous day if needed
+        # Try previous days if today's file is missing
         if not pred_file.exists():
             for days_back in range(1, 4):
                 prev_date = (start_time - timedelta(days=days_back)).strftime("%Y-%m-%d")
@@ -98,9 +61,6 @@ def main():
         preds = pd.read_csv(pred_file)
         logger.info(f"Loaded predictions: {len(preds)} stocks from {pred_file.name}")
 
-        # --------------------------------------------------
-        # 3. Compare Actual vs Predicted
-        # --------------------------------------------------
         results = []
         error_rows = []
 
@@ -152,17 +112,17 @@ def main():
             except Exception as e:
                 logger.warning(f"Retrain failed for {symbol}: {e}")
 
-        # --------------------------------------------------
-        # 4. Check if we got any data
-        # --------------------------------------------------
+        # -------------------------------------------------
+        # Check if we got any data
+        # -------------------------------------------------
         if not results:
             send_telegram(f"⚠️ *Evening Job*: Could not fetch actual data for any stock on `{today_str}`")
             logger.error("No actual data fetched for any stock")
             return
 
-        # --------------------------------------------------
-        # 5. Save error history
-        # --------------------------------------------------
+        # -------------------------------------------------
+        # Save error history
+        # -------------------------------------------------
         err_path = Path(cfg.paths.errors_file)
         err_path.parent.mkdir(parents=True, exist_ok=True)
 
