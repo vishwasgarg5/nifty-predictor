@@ -1,12 +1,12 @@
+# src/universe.py
 import logging
 from pathlib import Path
 import pandas as pd
 from src.config import cfg
-from src.ipo import load_ipo_watchlist, filter_eligible_ipos
+from src.ipo import filter_eligible_ipos
 
 logger = logging.getLogger(__name__)
 
-# Minimal built-in fallbacks
 _FALLBACKS = {
     "nifty50": [
         "RELIANCE.NS","TCS.NS","HDFCBANK.NS","INFY.NS","ICICIBANK.NS",
@@ -18,9 +18,21 @@ _FALLBACKS = {
         "HINDUNILVR.NS","ITC.NS","SBIN.NS","BHARTIARTL.NS","KOTAKBANK.NS",
         "LT.NS","AXISBANK.NS","BAJFINANCE.NS","ASIANPAINT.NS","MARUTI.NS",
         "SUNPHARMA.NS","TITAN.NS","WIPRO.NS","ULTRACEMCO.NS","NESTLEIND.NS",
-        "POWERGRID.NS","NTPC.NS","TECHM.NS","HCLTECH.NS","M&M.NS"
+        "POWERGRID.NS","NTPC.NS","TECHM.NS","HCLTECH.NS","M&M.NS",
+        "TATAMOTORS.NS","ADANIENT.NS","JSWSTEEL.NS","INDUSINDBK.NS","BAJAJFINSV.NS",
+        "ONGC.NS","COALINDIA.NS","GRASIM.NS","BRITANNIA.NS","CIPLA.NS"
     ],
-    "nifty500": None,  # use file or extended fallback
+    "nifty500": [
+        "RELIANCE.NS","TCS.NS","HDFCBANK.NS","INFY.NS","ICICIBANK.NS",
+        "HINDUNILVR.NS","ITC.NS","SBIN.NS","BHARTIARTL.NS","KOTAKBANK.NS",
+        "LT.NS","AXISBANK.NS","BAJFINANCE.NS","ASIANPAINT.NS","MARUTI.NS",
+        "SUNPHARMA.NS","TITAN.NS","WIPRO.NS","ULTRACEMCO.NS","NESTLEIND.NS",
+        "POWERGRID.NS","NTPC.NS","TECHM.NS","HCLTECH.NS","M&M.NS",
+        "TATAMOTORS.NS","ADANIENT.NS","JSWSTEEL.NS","INDUSINDBK.NS","BAJAJFINSV.NS",
+        "ONGC.NS","COALINDIA.NS","GRASIM.NS","BRITANNIA.NS","CIPLA.NS",
+        "DRREDDY.NS","EICHERMOT.NS","HEROMOTOCO.NS","APOLLOHOSP.NS","ADANIPORTS.NS",
+        "TATASTEEL.NS","SBILIFE.NS","HDFCLIFE.NS","BAJAJ-AUTO.NS","PIDILITIND.NS"
+    ],
 }
 
 
@@ -38,33 +50,36 @@ def _load_universe_file(name: str) -> list[str]:
 
 
 def get_universe_symbols(names: list[str] | None = None) -> list[str]:
-    """
-    Merge multiple universes + optional IPO watchlist.
-    """
-    names = names or list(cfg.universes.primary) + list(getattr(cfg.universes, "secondary", []))
+    """Merge multiple universes + optional eligible IPOs."""
+    if names is None:
+        primary = list(getattr(cfg.universes, "primary", ["nifty100"]))
+        secondary = list(getattr(cfg.universes, "secondary", []))
+        names = primary + secondary
+
     symbols = set()
 
     for name in names:
-        name = str(name).lower()
+        name = str(name).lower().strip()
         file_syms = _load_universe_file(name)
         if file_syms:
             symbols.update(file_syms)
             logger.info(f"Universe {name}: {len(file_syms)} from file")
-        elif name in _FALLBACKS and _FALLBACKS[name]:
-            symbols.update(_FALLBACKS[name])
-            logger.info(f"Universe {name}: {len(_FALLBACKS[name])} fallback")
+        elif name in _FALLBACKS:
+            fb = _FALLBACKS[name]
+            symbols.update(fb)
+            logger.info(f"Universe {name}: {len(fb)} fallback")
         else:
-            # try nifty500 style extended fallback via data_loader if needed
-            from src.data_loader import get_universe_symbols as legacy
-            # only once
-            pass
+            logger.warning(f"Universe {name}: no file and no fallback")
 
-    # IPO eligible
+    # IPO
     if getattr(cfg.universes, "include_ipo", False):
-        ipos = filter_eligible_ipos()
-        if ipos:
-            symbols.update(ipos)
-            logger.info(f"Added {len(ipos)} eligible IPO stocks")
+        try:
+            ipos = filter_eligible_ipos()
+            if ipos:
+                symbols.update(ipos)
+                logger.info(f"Added {len(ipos)} eligible IPO stocks")
+        except Exception as e:
+            logger.warning(f"IPO filter failed: {e}")
 
     result = sorted(symbols)
     logger.info(f"Total unique symbols: {len(result)}")
