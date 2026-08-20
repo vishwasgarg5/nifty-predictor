@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Evening Job - Actual vs Predicted + Error Logging + Light Retrain
-Runs every trading day ~16:15 IST
+Improved version with better data fetching and clean table output
 """
 
 import sys
@@ -13,8 +13,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import logging
 import pandas as pd
 from datetime import datetime, timedelta
-from pathlib import Path
 import traceback
+import time
 
 from src.config import cfg
 from src.holidays import is_trading_day
@@ -33,6 +33,33 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def get_actual_close(symbol: str, retries: int = 4):
+    """Robustly fetch the latest actual close price."""
+    for attempt in range(1, retries + 1):
+        try:
+            df = download_history(symbol, period="5d")
+            if df is None or df.empty:
+                raise ValueError("Empty dataframe")
+
+            # Handle MultiIndex columns
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+
+            if "Close" not in df.columns:
+                raise ValueError("Close column missing")
+
+            actual_close = float(df["Close"].iloc[-1])
+            prev_close = float(df["Close"].iloc[-2]) if len(df) >= 2 else actual_close
+
+            return actual_close, prev_close
+
+        except Exception as e:
+            logger.warning(f"{symbol} actual data attempt {attempt}/{retries} failed: {e}")
+            time.sleep(1.2 * attempt)
+
+    return None, None
+
+
 def main():
     start_time = datetime.now()
     today_str = start_time.strftime("%Y-%m-%d")
@@ -40,7 +67,7 @@ def main():
     logger.info(f"Evening Job started | {today_str}")
 
     # --------------------------------------------------
-    # 1. Holiday / Weekend check
+    # 1. Holiday check
     # --------------------------------------------------
     if not is_trading_day():
         logger.info("Today is not a trading day. Exiting cleanly.")
@@ -48,102 +75,89 @@ def main():
 
     try:
         # --------------------------------------------------
-        # 2. Load today's predictions
+        # 2. Load predictions
         # --------------------------------------------------
         pred_dir = Path(cfg.paths.predictions)
         pred_file = pred_dir / f"{today_str}.csv"
 
-        # Fallback to yesterday if today's file is missing
+        # Fallback to previous day if needed
         if not pred_file.exists():
-            yesterday = (start_time - timedelta(days=1)).strftime("%Y-%m-%d")
-            pred_file = pred_dir / f"{yesterday}.csv"
-            logger.warning(f"Today's prediction file not found. Trying {yesterday}")
+            for days_back in range(1, 4):
+                prev_date = (start_time - timedelta(days=days_back)).strftime("%Y-%m-%d")
+                candidate = pred_dir / f"{prev_date}.csv"
+                if candidate.exists():
+                    pred_file = candidate
+                    logger.warning(f"Using prediction file from {prev_date}")
+                    break
 
         if not pred_file.exists():
-            msg = f"⚠️ *Evening Job*: No prediction file found for `{today_str}`"
-            send_telegram(msg)
+            send_telegram(f"⚠️ *Evening Job*: No prediction file found for `{today_str}`")
             logger.error("No prediction file found")
             return
 
         preds = pd.read_csv(pred_file)
-        logger.info(f"Loaded predictions from {pred_file.name} | {len(preds)} stocks")
+        logger.info(f"Loaded predictions: {len(preds)} stocks from {pred_file.name}")
 
         # --------------------------------------------------
         # 3. Compare Actual vs Predicted
         # --------------------------------------------------
-        lines = [
-            f"*Actual vs Predicted Report*",
-            f"Date: `{today_str}`",
-            ""
-        ]
-
+        results = []
         error_rows = []
-        success_count = 0
 
         for _, row in preds.iterrows():
             symbol = row["symbol"]
             clean_symbol = symbol.replace(".NS", "")
+            pred_close = float(row["Close"])
 
+            actual_close, prev_close = get_actual_close(symbol)
+
+            if actual_close is None:
+                logger.error(f"Could not fetch actual data for {symbol}")
+                continue
+
+            diff = actual_close - pred_close
+            pct_error = (diff / pred_close) * 100 if pred_close != 0 else 0
+            abs_pct = abs(pct_error)
+
+            # Direction accuracy
+            pred_direction = 1 if pred_close > prev_close else 0
+            actual_direction = 1 if actual_close > prev_close else 0
+            direction_correct = int(pred_direction == actual_direction)
+
+            results.append({
+                "symbol": clean_symbol,
+                "pred": pred_close,
+                "actual": actual_close,
+                "diff": diff,
+                "pct": pct_error
+            })
+
+            error_rows.append({
+                "date": today_str,
+                "symbol": symbol,
+                "pred_close": pred_close,
+                "actual_close": actual_close,
+                "abs_error": abs(diff),
+                "abs_error_pct": abs_pct,
+                "direction_correct": direction_correct
+            })
+
+            logger.info(f"{clean_symbol}: Pred {pred_close:.2f} → Actual {actual_close:.2f} ({pct_error:+.2f}%)")
+
+            # Light retrain
             try:
-                hist = download_history(symbol, period="5d")
-                if hist is None or len(hist) < 1:
-                    logger.warning(f"No actual data for {symbol}")
-                    continue
-
-                actual = hist.iloc[-1]
-                pred_close = float(row["Close"])
-                actual_close = float(actual["Close"])
-
-                diff = actual_close - pred_close
-                pct_error = (diff / pred_close) * 100 if pred_close != 0 else 0
-                abs_pct = abs(pct_error)
-
-                # Direction accuracy (simple)
-                prev_close = float(hist.iloc[-2]["Close"]) if len(hist) >= 2 else pred_close
-                pred_direction = 1 if pred_close > prev_close else 0
-                actual_direction = 1 if actual_close > prev_close else 0
-                direction_correct = int(pred_direction == actual_direction)
-
-                lines.append(f"*{clean_symbol}*")
-                lines.append(
-                    f"Pred C: `{pred_close:.2f}` → Actual C: `{actual_close:.2f}`"
-                )
-                lines.append(
-                    f"Diff: `{diff:+.2f}`  (`{pct_error:+.2f}%`)"
-                )
-                lines.append("")
-
-                error_rows.append({
-                    "date": today_str,
-                    "symbol": symbol,
-                    "pred_open": row.get("Open"),
-                    "pred_high": row.get("High"),
-                    "pred_low": row.get("Low"),
-                    "pred_close": pred_close,
-                    "actual_close": actual_close,
-                    "abs_error": abs(diff),
-                    "abs_error_pct": abs_pct,
-                    "direction_correct": direction_correct
-                })
-
-                success_count += 1
-
-                # --------------------------------------------------
-                # 4. Light retrain with latest data
-                # --------------------------------------------------
-                try:
-                    predictor = OHLCPredictor(symbol)
-                    predictor.train()
-                    logger.info(f"Model updated for {symbol}")
-                except Exception as e:
-                    logger.warning(f"Retrain failed for {symbol}: {e}")
-
+                predictor = OHLCPredictor(symbol)
+                predictor.train()
+                logger.info(f"Model updated for {symbol}")
             except Exception as e:
-                logger.error(f"Error processing {symbol}: {e}")
-                lines.append(f"*{clean_symbol}* → Error fetching actual data\n")
+                logger.warning(f"Retrain failed for {symbol}: {e}")
 
-        if success_count == 0:
-            send_telegram(f"⚠️ Evening Job: Could not fetch actual data for any stock on `{today_str}`")
+        # --------------------------------------------------
+        # 4. Check if we got any data
+        # --------------------------------------------------
+        if not results:
+            send_telegram(f"⚠️ *Evening Job*: Could not fetch actual data for any stock on `{today_str}`")
+            logger.error("No actual data fetched for any stock")
             return
 
         # --------------------------------------------------
@@ -153,7 +167,6 @@ def main():
         err_path.parent.mkdir(parents=True, exist_ok=True)
 
         err_df = pd.DataFrame(error_rows)
-
         if err_path.exists():
             err_df.to_csv(err_path, mode="a", header=False, index=False)
         else:
@@ -162,17 +175,36 @@ def main():
         logger.info(f"Error history updated → {err_path}")
 
         # --------------------------------------------------
-        # 6. Summary line
+        # 6. Build clean table message
         # --------------------------------------------------
+        lines = [
+            f"*ACTUAL vs PREDICTED*",
+            f"Date: `{today_str}`",
+            "",
+            "```",
+            f"{'Stock':<12} {'Pred C':>9} {'Actual C':>9} {'Diff':>8} {'Error%':>8}",
+            "-" * 50
+        ]
+
+        for r in results:
+            lines.append(
+                f"{r['symbol']:<12} {r['pred']:>9.2f} {r['actual']:>9.2f} "
+                f"{r['diff']:>+8.2f} {r['pct']:>+7.2f}%"
+            )
+
+        lines.append("```")
+        lines.append("")
+
+        # Summary
         avg_error = err_df["abs_error_pct"].mean()
+        dir_acc = err_df["direction_correct"].mean() * 100
+
         lines.append(f"*Summary*")
-        lines.append(f"Stocks processed: `{success_count}`")
-        lines.append(f"Average Absolute Error: `{avg_error:.2f}%`")
+        lines.append(f"• Stocks processed: `{len(results)}`")
+        lines.append(f"• Average Absolute Error: `{avg_error:.2f}%`")
+        lines.append(f"• Directional Accuracy: `{dir_acc:.1f}%`")
         lines.append(f"_Job finished in {(datetime.now() - start_time).seconds}s_")
 
-        # --------------------------------------------------
-        # 7. Send Telegram
-        # --------------------------------------------------
         message = "\n".join(lines)
         success = send_telegram(message)
 
