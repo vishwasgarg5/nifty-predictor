@@ -19,7 +19,7 @@ import traceback
 
 from src.config import cfg
 from src.holidays import is_trading_day
-from src.data_loader import get_universe_symbols
+from src.universe import get_universe_symbols
 from src.scoring import select_top5
 from src.model import OHLCPredictor
 from src.sentiment import get_sentiment_engine
