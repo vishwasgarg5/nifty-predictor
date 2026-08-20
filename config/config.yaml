@@ -1,35 +1,46 @@
-universe: "nifty100"          # nifty50 | nifty100 | nifty200
+universe: "nifty500"
 top_n: 5
-lookback_days: 300
-min_history_days: 90
+lookback_days: 180          # reduced for speed
+min_history_days: 60
 
 scoring:
-  rsi_oversold: 55
-  volume_spike: 1.05
-  pe_max: 100
-  pb_max: 15
-  roe_min: 0.01
-  min_avg_volume: 50000
-  max_atr_pct: 12.0
+  rsi_oversold: 42
+  volume_spike: 1.15
+  pe_max: 55
+  pb_max: 10
+  roe_min: 0.08
+  min_avg_volume: 100000
+  max_atr_pct: 8.0
   weights:
-    technical: 0.8
-    fundamental: 0.2
+    technical: 0.70
+    fundamental: 0.30
+  prefilter_top: 40         # score only top 40 after cheap filter
 
 model:
-  n_estimators: 160
-  max_depth: 5
-  learning_rate: 0.045
+  n_estimators: 120
+  max_depth: 4
+  learning_rate: 0.05
   retrain_every_days: 1
 
+drift:
+  mape_threshold: 3.5       # % – trigger alert if weekly MAPE > this
+  dir_acc_threshold: 52     # % – alert if directional accuracy below this
+  lookback_days: 10
+
+tuning:
+  enabled: true
+  trials: 12                # keep small for GitHub Actions
+  run_on: "saturday"        # only weekly
+
 sentiment:
-  max_articles: 7
+  max_articles: 6
   use_finbert: true
-  finbert_timeout: 90
 
 paths:
   predictions: "data/predictions"
   history: "data/history"
   models: "models"
-  nifty_cache: "data/nifty_cache.csv"
+  nifty_cache: "data/nifty500_cache.csv"
   errors_file: "data/history/daily_errors.csv"
   weekly_file: "data/history/weekly_reports.csv"
+  drift_file: "data/history/drift_log.csv"
