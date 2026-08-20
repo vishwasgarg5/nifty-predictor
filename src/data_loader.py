@@ -9,23 +9,31 @@ from src.config import cfg
 
 logger = logging.getLogger(__name__)
 
-# Better headers to reduce blocking
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-}
+def _get_session():
+    """Browser-like session – fixes empty/NaN data on GitHub Actions."""
+    try:
+        from curl_cffi import requests as cffi_requests
+        session = cffi_requests.Session(impersonate="chrome")
+        return session
+    except Exception as e:
+        logger.warning(f"curl_cffi not available, falling back to default session: {e}")
+        return None
+
 
 def get_universe_symbols():
     cache = Path(cfg.paths.nifty_cache)
     if cache.exists():
         try:
             df = pd.read_csv(cache)
-            symbols = [s if str(s).endswith(".NS") else f"{s}.NS" for s in df["Symbol"].tolist()]
+            symbols = [
+                s if str(s).endswith(".NS") else f"{s}.NS"
+                for s in df["Symbol"].tolist()
+            ]
             logger.info(f"Loaded {len(symbols)} symbols from cache")
             return symbols
         except Exception as e:
-            logger.warning(f"Failed reading cache: {e}")
+            logger.warning(f"Cache read failed: {e}")
 
-    # Solid liquid fallback (Nifty 50 style)
     fallback = [
         "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
         "HINDUNILVR.NS", "ITC.NS", "SBIN.NS", "BHARTIARTL.NS", "KOTAKBANK.NS",
@@ -40,40 +48,57 @@ def get_universe_symbols():
 
 def download_history(symbol: str, period: str = "5d", retries: int = 5):
     """
-    More reliable way to get data on GitHub Actions.
-    Uses Ticker.history() instead of yf.download() + better retries.
+    Reliable history fetch for GitHub Actions.
+    Uses curl_cffi Chrome impersonation when available.
     """
+    session = None
+    try:
+        from curl_cffi import requests as cffi_requests
+        session = cffi_requests.Session(impersonate="chrome")
+    except Exception as e:
+        logger.warning(f"curl_cffi session not available: {e}")
+
     for attempt in range(1, retries + 1):
         try:
-            ticker = yf.Ticker(symbol)
+            ticker = yf.Ticker(symbol, session=session) if session else yf.Ticker(symbol)
             df = ticker.history(period=period, auto_adjust=True)
 
             if df is None or df.empty:
-                raise ValueError("Empty dataframe returned")
+                raise ValueError("Empty dataframe")
 
-            # Fix MultiIndex if present
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
 
-            # Ensure we have Close
             if "Close" not in df.columns:
                 raise ValueError("Close column missing")
+
+            # Drop rows where Close is NaN
+            df = df.dropna(subset=["Close"])
+            if df.empty:
+                raise ValueError("All Close values are NaN")
 
             return df
 
         except Exception as e:
             logger.warning(f"{symbol} attempt {attempt}/{retries} failed: {e}")
-            time.sleep(2 * attempt)  # longer backoff
+            time.sleep(2 * attempt)
 
     return None
 
 
 def get_actual_close(symbol: str, retries: int = 5):
-    """Get the latest actual close + previous close."""
+    """Return (actual_close, prev_close) or (None, None)."""
     df = download_history(symbol, period="5d", retries=retries)
     if df is None or df.empty:
         return None, None
 
-    actual_close = float(df["Close"].iloc[-1])
-    prev_close = float(df["Close"].iloc[-2]) if len(df) >= 2 else actual_close
-    return actual_close, prev_close
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    actual_close = df["Close"].iloc[-1]
+    prev_close = df["Close"].iloc[-2] if len(df) >= 2 else actual_close
+
+    if pd.isna(actual_close):
+        return None, None
+
+    return float(actual_close), float(prev_close)
