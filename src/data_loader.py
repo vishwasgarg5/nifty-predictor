@@ -86,19 +86,33 @@ def download_history(symbol: str, period: str = "5d", retries: int = 5):
     return None
 
 
-def get_actual_close(symbol: str, retries: int = 5):
-    """Return (actual_close, prev_close) or (None, None)."""
+def get_actual_ohlc(symbol: str, retries: int = 5):
+    """
+    Returns dict with actual Open, High, Low, Close + previous close
+    or None if failed.
+    """
     df = download_history(symbol, period="5d", retries=retries)
     if df is None or df.empty:
-        return None, None
+        return None
 
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    actual_close = df["Close"].iloc[-1]
-    prev_close = df["Close"].iloc[-2] if len(df) >= 2 else actual_close
+    required = ["Open", "High", "Low", "Close"]
+    for col in required:
+        if col not in df.columns:
+            return None
 
-    if pd.isna(actual_close):
-        return None, None
+    last = df.iloc[-1]
+    prev_close = float(df["Close"].iloc[-2]) if len(df) >= 2 else float(last["Close"])
 
-    return float(actual_close), float(prev_close)
+    if pd.isna(last["Close"]) or pd.isna(last["Open"]):
+        return None
+
+    return {
+        "Open": float(last["Open"]),
+        "High": float(last["High"]),
+        "Low": float(last["Low"]),
+        "Close": float(last["Close"]),
+        "prev_close": prev_close
+    }
