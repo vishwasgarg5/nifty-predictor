@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Evening Job - Actual vs Predicted + Error Logging + Light Retrain
-Clean table format + better error handling
+Clean table format + proper NaN handling
 """
 
 import sys
@@ -12,12 +12,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import logging
 import pandas as pd
+import numpy as np
 from datetime import datetime, timedelta
 import traceback
+import time
 
 from src.config import cfg
 from src.holidays import is_trading_day
-from src.data_loader import download_history, get_actual_close
+from src.data_loader import download_history
 from src.model import OHLCPredictor
 from src.telegram_utils import send_telegram
 
@@ -27,6 +29,38 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 logger = logging.getLogger(__name__)
+
+
+def get_actual_close(symbol: str, retries: int = 5):
+    """Get latest actual close + previous close with proper validation."""
+    for attempt in range(1, retries + 1):
+        try:
+            df = download_history(symbol, period="5d", retries=2)
+            
+            if df is None or df.empty:
+                raise ValueError("Empty dataframe")
+
+            # Fix MultiIndex columns
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+
+            if "Close" not in df.columns:
+                raise ValueError("Close column missing")
+
+            actual_close = df["Close"].iloc[-1]
+            prev_close = df["Close"].iloc[-2] if len(df) >= 2 else actual_close
+
+            # Critical: check for NaN
+            if pd.isna(actual_close):
+                raise ValueError("Actual close is NaN")
+
+            return float(actual_close), float(prev_close)
+
+        except Exception as e:
+            logger.warning(f"{symbol} actual data attempt {attempt}/{retries} failed: {e}")
+            time.sleep(2 * attempt)
+
+    return None, None
 
 
 def main():
@@ -71,8 +105,9 @@ def main():
 
             actual_close, prev_close = get_actual_close(symbol)
 
-            if actual_close is None:
-                logger.error(f"Could not fetch actual data for {symbol}")
+            # Critical NaN check
+            if actual_close is None or pd.isna(actual_close):
+                logger.error(f"Could not fetch valid actual data for {symbol}")
                 continue
 
             diff = actual_close - pred_close
@@ -113,7 +148,7 @@ def main():
                 logger.warning(f"Retrain failed for {symbol}: {e}")
 
         # -------------------------------------------------
-        # Check if we got any data
+        # Check if we got any valid data
         # -------------------------------------------------
         if not results:
             send_telegram(f"⚠️ *Evening Job*: Could not fetch actual data for any stock on `{today_str}`")
@@ -180,6 +215,37 @@ def main():
 
     logger.info("Evening Job finished")
     logger.info("=" * 60)
+
+
+def get_actual_close(symbol: str, retries: int = 5):
+    """Get latest actual close + previous close with proper NaN checks."""
+    for attempt in range(1, retries + 1):
+        try:
+            df = download_history(symbol, period="5d", retries=2)
+
+            if df is None or df.empty:
+                raise ValueError("Empty dataframe")
+
+            # Fix MultiIndex
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+
+            if "Close" not in df.columns:
+                raise ValueError("Close column missing")
+
+            actual_close = df["Close"].iloc[-1]
+            prev_close = df["Close"].iloc[-2] if len(df) >= 2 else actual_close
+
+            if pd.isna(actual_close):
+                raise ValueError("Actual close is NaN")
+
+            return float(actual_close), float(prev_close)
+
+        except Exception as e:
+            logger.warning(f"{symbol} actual data attempt {attempt}/{retries} failed: {e}")
+            time.sleep(2 * attempt)
+
+    return None, None
 
 
 if __name__ == "__main__":
