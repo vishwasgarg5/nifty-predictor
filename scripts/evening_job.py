@@ -66,39 +66,51 @@ def main():
 
         for _, row in preds.iterrows():
             symbol = row["symbol"]
-            clean_symbol = symbol.replace(".NS", "")
-            pred_close = float(row["Close"])
+            clean = symbol.replace(".NS", "")
 
-            actual_close, prev_close = get_actual_close(symbol)
+            pred_o = float(row.get("Open", 0))
+            pred_c = float(row["Close"])
 
-            if actual_close is None or pd.isna(actual_close):
+            actual = get_actual_ohlc(symbol)
+
+            if actual is None:
                 logger.error(f"Could not fetch valid actual data for {symbol}")
                 continue
 
-            diff = actual_close - pred_close
-            pct_error = (diff / pred_close) * 100 if pred_close != 0 else 0
-            abs_pct = abs(pct_error)
+            # Open metrics
+            diff_o = actual["Open"] - pred_o
+            pct_o = (diff_o / pred_o * 100) if pred_o else 0
 
-            pred_direction = 1 if pred_close > prev_close else 0
-            actual_direction = 1 if actual_close > prev_close else 0
-            direction_correct = int(pred_direction == actual_direction)
+            # Close metrics
+            diff_c = actual["Close"] - pred_c
+            pct_c = (diff_c / pred_c * 100) if pred_c else 0
 
             results.append({
-                "symbol": clean_symbol,
-                "pred": pred_close,
-                "actual": actual_close,
-                "diff": diff,
-                "pct": pct_error
+                "symbol": clean,
+                "pred_o": pred_o,
+                "actual_o": actual["Open"],
+                "diff_o": diff_o,
+                "pct_o": pct_o,
+                "pred_c": pred_c,
+                "actual_c": actual["Close"],
+                "diff_c": diff_c,
+                "pct_c": pct_c,
             })
 
             error_rows.append({
                 "date": today_str,
                 "symbol": symbol,
-                "pred_close": pred_close,
-                "actual_close": actual_close,
-                "abs_error": abs(diff),
-                "abs_error_pct": abs_pct,
-                "direction_correct": direction_correct
+                "pred_open": pred_o,
+                "actual_open": actual["Open"],
+                "pred_close": pred_c,
+                "actual_close": actual["Close"],
+                "abs_error_open": abs(diff_o),
+                "abs_error_pct_open": abs(pct_o),
+                "abs_error": abs(diff_c),
+                "abs_error_pct": abs(pct_c),
+                "direction_correct": int(
+                    (pred_c > actual["prev_close"]) == (actual["Close"] > actual["prev_close"])
+                )
             })
 
             logger.info(
