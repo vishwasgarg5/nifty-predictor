@@ -1,6 +1,16 @@
-universe: "nifty500"
+# Active universes (can enable multiple)
+universes:
+  primary:
+    - nifty100
+    - nifty500
+  secondary:
+    - midcap150
+  include_ipo: true
+  ipo_min_trading_days: 30
+  ipo_min_avg_volume: 100000
+
 top_n: 5
-lookback_days: 180          # reduced for speed
+lookback_days: 180
 min_history_days: 60
 
 scoring:
@@ -11,26 +21,23 @@ scoring:
   roe_min: 0.08
   min_avg_volume: 100000
   max_atr_pct: 8.0
+  prefilter_top: 40
   weights:
     technical: 0.70
     fundamental: 0.30
-  prefilter_top: 40         # score only top 40 after cheap filter
 
 model:
   n_estimators: 120
   max_depth: 4
   learning_rate: 0.05
-  retrain_every_days: 1
 
 drift:
-  mape_threshold: 3.5       # % – trigger alert if weekly MAPE > this
-  dir_acc_threshold: 52     # % – alert if directional accuracy below this
+  mape_threshold: 3.5
+  dir_acc_threshold: 52
   lookback_days: 10
 
 tuning:
   enabled: true
-  trials: 12                # keep small for GitHub Actions
-  run_on: "saturday"        # only weekly
 
 sentiment:
   max_articles: 6
@@ -40,7 +47,8 @@ paths:
   predictions: "data/predictions"
   history: "data/history"
   models: "models"
-  nifty_cache: "data/nifty500_cache.csv"
+  universes_dir: "data/universes"
   errors_file: "data/history/daily_errors.csv"
   weekly_file: "data/history/weekly_reports.csv"
   drift_file: "data/history/drift_log.csv"
+  ipo_file: "data/universes/ipo_watchlist.csv"
