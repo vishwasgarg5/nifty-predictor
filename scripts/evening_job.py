@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Evening Job - Actual vs Predicted + Error Logging + Light Retrain
-Clean table format
+Evening Job - Actual vs Predicted (Open + Close)
+Clean table format + Error logging + Light retrain
 """
 
 import sys
@@ -17,7 +17,7 @@ import traceback
 
 from src.config import cfg
 from src.holidays import is_trading_day
-from src.data_loader import download_history, get_actual_close
+from src.data_loader import get_actual_ohlc
 from src.model import OHLCPredictor
 from src.telegram_utils import send_telegram
 
@@ -40,10 +40,12 @@ def main():
         return
 
     try:
+        # --------------------------------------------------
+        # 1. Load predictions
+        # --------------------------------------------------
         pred_dir = Path(cfg.paths.predictions)
         pred_file = pred_dir / f"{today_str}.csv"
 
-        # Fallback to previous days if needed
         if not pred_file.exists():
             for days_back in range(1, 4):
                 prev_date = (start_time - timedelta(days=days_back)).strftime("%Y-%m-%d")
@@ -61,6 +63,9 @@ def main():
         preds = pd.read_csv(pred_file)
         logger.info(f"Loaded predictions: {len(preds)} stocks from {pred_file.name}")
 
+        # --------------------------------------------------
+        # 2. Compare Actual vs Predicted
+        # --------------------------------------------------
         results = []
         error_rows = []
 
@@ -69,6 +74,8 @@ def main():
             clean = symbol.replace(".NS", "")
 
             pred_o = float(row.get("Open", 0))
+            pred_h = float(row.get("High", 0))
+            pred_l = float(row.get("Low", 0))
             pred_c = float(row["Close"])
 
             actual = get_actual_ohlc(symbol)
@@ -102,6 +109,10 @@ def main():
                 "symbol": symbol,
                 "pred_open": pred_o,
                 "actual_open": actual["Open"],
+                "pred_high": pred_h,
+                "actual_high": actual["High"],
+                "pred_low": pred_l,
+                "actual_low": actual["Low"],
                 "pred_close": pred_c,
                 "actual_close": actual["Close"],
                 "abs_error_open": abs(diff_o),
@@ -114,7 +125,8 @@ def main():
             })
 
             logger.info(
-                f"{clean_symbol}: Pred {pred_close:.2f} → Actual {actual_close:.2f} ({pct_error:+.2f}%)"
+                f"{clean}: O {pred_o:.2f}→{actual['Open']:.2f} | "
+                f"C {pred_c:.2f}→{actual['Close']:.2f}"
             )
 
             # Light retrain
@@ -126,17 +138,17 @@ def main():
                 logger.warning(f"Retrain failed for {symbol}: {e}")
 
         if not results:
-            send_telegram(
-                f"⚠️ *Evening Job*: Could not fetch actual data for any stock on `{today_str}`"
-            )
+            send_telegram(f"⚠️ *Evening Job*: Could not fetch actual data for any stock on `{today_str}`")
             logger.error("No actual data fetched for any stock")
             return
 
-        # Save error history
+        # --------------------------------------------------
+        # 3. Save error history
+        # --------------------------------------------------
         err_path = Path(cfg.paths.errors_file)
         err_path.parent.mkdir(parents=True, exist_ok=True)
-        err_df = pd.DataFrame(error_rows)
 
+        err_df = pd.DataFrame(error_rows)
         if err_path.exists():
             err_df.to_csv(err_path, mode="a", header=False, index=False)
         else:
@@ -145,32 +157,49 @@ def main():
         logger.info(f"Error history updated → {err_path}")
 
         # --------------------------------------------------
-        # Clean table message
+        # 4. Build clean Telegram message (Open + Close)
         # --------------------------------------------------
         lines = [
             f"*ACTUAL vs PREDICTED*",
             f"Date: `{today_str}`",
             "",
+            "*OPEN*",
             "```",
-            f"{'Stock':<12} {'Pred C':>9} {'Actual C':>9} {'Diff':>8} {'Error%':>8}",
+            f"{'Stock':<12} {'Pred O':>9} {'Actual O':>9} {'Diff':>8} {'Err%':>7}",
             "-" * 50
         ]
 
         for r in results:
             lines.append(
-                f"{r['symbol']:<12} {r['pred']:>9.2f} {r['actual']:>9.2f} "
-                f"{r['diff']:>+8.2f} {r['pct']:>+7.2f}%"
+                f"{r['symbol']:<12} {r['pred_o']:>9.2f} {r['actual_o']:>9.2f} "
+                f"{r['diff_o']:>+8.2f} {r['pct_o']:>+6.2f}%"
+            )
+
+        lines.append("```")
+        lines.append("")
+        lines.append("*CLOSE*")
+        lines.append("```")
+        lines.append(f"{'Stock':<12} {'Pred C':>9} {'Actual C':>9} {'Diff':>8} {'Err%':>7}")
+        lines.append("-" * 50)
+
+        for r in results:
+            lines.append(
+                f"{r['symbol']:<12} {r['pred_c']:>9.2f} {r['actual_c']:>9.2f} "
+                f"{r['diff_c']:>+8.2f} {r['pct_c']:>+6.2f}%"
             )
 
         lines.append("```")
         lines.append("")
 
-        avg_error = err_df["abs_error_pct"].mean()
+        # Summary
+        avg_open_error = err_df["abs_error_pct_open"].mean()
+        avg_close_error = err_df["abs_error_pct"].mean()
         dir_acc = err_df["direction_correct"].mean() * 100
 
         lines.append("*Summary*")
         lines.append(f"• Stocks processed: `{len(results)}`")
-        lines.append(f"• Average Absolute Error: `{avg_error:.2f}%`")
+        lines.append(f"• Avg Error (Open): `{avg_open_error:.2f}%`")
+        lines.append(f"• Avg Error (Close): `{avg_close_error:.2f}%`")
         lines.append(f"• Directional Accuracy: `{dir_acc:.1f}%`")
         lines.append(f"_Job finished in {(datetime.now() - start_time).seconds}s_")
 
