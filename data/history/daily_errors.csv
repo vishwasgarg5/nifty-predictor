@@ -1,0 +1,6 @@
+date,symbol,pred_close,actual_close,abs_error,abs_error_pct,direction_correct
+2026-08-20,RELIANCE.NS,1308.56,,,,1
+2026-08-20,LT.NS,4054.27,,,,0
+2026-08-20,JSWSTEEL.NS,1289.95,,,,0
+2026-08-20,ICICIBANK.NS,1407.71,,,,0
+2026-08-20,TCS.NS,2302.69,,,,0
