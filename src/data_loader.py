@@ -8,16 +8,6 @@ from src.config import cfg
 
 logger = logging.getLogger(__name__)
 
-NIFTY500_FALLBACK = [
-    "RELIANCE.NS","TCS.NS","HDFCBANK.NS","INFY.NS","ICICIBANK.NS","HINDUNILVR.NS",
-    "ITC.NS","SBIN.NS","BHARTIARTL.NS","KOTAKBANK.NS","LT.NS","AXISBANK.NS",
-    "BAJFINANCE.NS","ASIANPAINT.NS","MARUTI.NS","SUNPHARMA.NS","TITAN.NS","WIPRO.NS",
-    "ULTRACEMCO.NS","NESTLEIND.NS","POWERGRID.NS","NTPC.NS","TECHM.NS","HCLTECH.NS",
-    "M&M.NS","TATAMOTORS.NS","ADANIENT.NS","JSWSTEEL.NS","INDUSINDBK.NS","BAJAJFINSV.NS",
-    "ONGC.NS","COALINDIA.NS","BPCL.NS","HINDALCO.NS","GRASIM.NS","DIVISLAB.NS",
-    "CIPLA.NS","DRREDDY.NS","EICHERMOT.NS","HEROMOTOCO.NS","BRITANNIA.NS","APOLLOHOSP.NS",
-    "ADANIPORTS.NS","TATASTEEL.NS","SBILIFE.NS","HDFCLIFE.NS","BAJAJ-AUTO.NS","PIDILITIND.NS"
-]
 
 def _session():
     try:
@@ -26,34 +16,9 @@ def _session():
     except Exception:
         return None
 
-def get_universe_symbols():
-    cache = Path(cfg.paths.nifty_cache)
-    if cache.exists():
-        try:
-            df = pd.read_csv(cache)
-            syms = [s if str(s).endswith(".NS") else f"{s}.NS" for s in df["Symbol"].tolist()]
-            if len(syms) > 50:
-                logger.info(f"Loaded {len(syms)} symbols from Nifty 500 cache")
-                return syms
-        except Exception as e:
-            logger.warning(f"Cache failed: {e}")
-
-    # Try official CSV
-    try:
-        url = "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
-        df = pd.read_csv(url)
-        syms = [s + ".NS" for s in df["Symbol"].tolist()]
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        df.to_csv(cache, index=False)
-        logger.info(f"Fetched live Nifty 500 list: {len(syms)}")
-        return syms
-    except Exception as e:
-        logger.warning(f"Live Nifty 500 fetch failed: {e}")
-
-    logger.warning(f"Using fallback list ({len(NIFTY500_FALLBACK)})")
-    return NIFTY500_FALLBACK
 
 def download_history(symbol: str, period: str = "6mo", retries: int = 3):
+    """Primary: yfinance with browser impersonation."""
     session = _session()
     for attempt in range(1, retries + 1):
         try:
@@ -64,31 +29,95 @@ def download_history(symbol: str, period: str = "6mo", retries: int = 3):
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
             df = df.dropna(subset=["Close"])
-            if len(df) < 30:
+            if len(df) < 20:
                 raise ValueError("too few rows")
             return df
         except Exception as e:
-            logger.debug(f"{symbol} attempt {attempt}: {e}")
+            logger.debug(f"{symbol} yfinance {attempt}/{retries}: {e}")
             time.sleep(1.2 * attempt)
     return None
 
-def get_actual_ohlc(symbol: str, retries: int = 4):
-    df = download_history(symbol, period="5d", retries=retries)
-    if df is None or df.empty:
-        return None
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    for col in ["Open", "High", "Low", "Close"]:
-        if col not in df.columns:
+
+def _from_nsepython(symbol: str, days: int = 15) -> pd.DataFrame | None:
+    """Fallback: NSE historical via nsepython."""
+    try:
+        from nsepython import equity_history
+        clean = symbol.replace(".NS", "").replace(".BO", "")
+        end = datetime.now()
+        start = end - timedelta(days=days)
+        raw = equity_history(
+            clean, "EQ",
+            start.strftime("%d-%m-%Y"),
+            end.strftime("%d-%m-%Y")
+        )
+        if raw is None or raw.empty:
             return None
-    last = df.iloc[-1]
-    if pd.isna(last["Close"]) or pd.isna(last["Open"]):
+
+        # Normalize column names
+        colmap = {}
+        for c in raw.columns:
+            cl = str(c).lower()
+            if "open" in cl and "Open" not in colmap:
+                colmap[c] = "Open"
+            elif "high" in cl and "High" not in colmap:
+                colmap[c] = "High"
+            elif "low" in cl and "Low" not in colmap:
+                colmap[c] = "Low"
+            elif "close" in cl and "prev" not in cl and "Close" not in colmap:
+                colmap[c] = "Close"
+            elif "vol" in cl and "Volume" not in colmap:
+                colmap[c] = "Volume"
+
+        df = raw.rename(columns=colmap)
+        for need in ["Open", "High", "Low", "Close"]:
+            if need not in df.columns:
+                return None
+        if "Volume" not in df.columns:
+            df["Volume"] = 0
+        df = df.dropna(subset=["Close", "Open"])
+        return df if not df.empty else None
+    except Exception as e:
+        logger.warning(f"{symbol} nsepython failed: {e}")
         return None
-    prev = float(df["Close"].iloc[-2]) if len(df) >= 2 else float(last["Close"])
-    return {
-        "Open": float(last["Open"]),
-        "High": float(last["High"]),
-        "Low": float(last["Low"]),
-        "Close": float(last["Close"]),
-        "prev_close": prev
-    }
+
+
+def get_actual_ohlc(symbol: str, retries: int = 4) -> dict | None:
+    """
+    Actual OHLC with fallback chain:
+    1) yfinance
+    2) nsepython
+    """
+    # --- yfinance ---
+    df = download_history(symbol, period="5d", retries=retries)
+    if df is not None and not df.empty:
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        if all(c in df.columns for c in ["Open", "High", "Low", "Close"]):
+            last = df.iloc[-1]
+            if not pd.isna(last["Close"]) and not pd.isna(last["Open"]):
+                prev = float(df["Close"].iloc[-2]) if len(df) >= 2 else float(last["Close"])
+                return {
+                    "Open": float(last["Open"]),
+                    "High": float(last["High"]),
+                    "Low": float(last["Low"]),
+                    "Close": float(last["Close"]),
+                    "prev_close": prev,
+                    "source": "yfinance"
+                }
+
+    # --- nsepython fallback ---
+    nse_df = _from_nsepython(symbol, days=12)
+    if nse_df is not None and not nse_df.empty:
+        last = nse_df.iloc[-1]
+        prev = float(nse_df["Close"].iloc[-2]) if len(nse_df) >= 2 else float(last["Close"])
+        logger.info(f"{symbol}: actual via nsepython")
+        return {
+            "Open": float(last["Open"]),
+            "High": float(last["High"]),
+            "Low": float(last["Low"]),
+            "Close": float(last["Close"]),
+            "prev_close": prev,
+            "source": "nsepython"
+        }
+
+    return None
