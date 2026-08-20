@@ -1,27 +1,31 @@
 # src/data_loader.py
 import time
 import logging
+from pathlib import Path
+from datetime import datetime, timedelta
 import pandas as pd
 import yfinance as yf
-from pathlib import Path
 from src.config import cfg
 
 logger = logging.getLogger(__name__)
 
+# Better headers to reduce blocking
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}
+
 def get_universe_symbols():
-    """Return list of symbols. Prefer cache, otherwise use a solid Nifty-100 style list."""
     cache = Path(cfg.paths.nifty_cache)
-    
     if cache.exists():
         try:
             df = pd.read_csv(cache)
-            symbols = [s if str(s).endswith(".NS") else str(s) + ".NS" for s in df["Symbol"].tolist()]
+            symbols = [s if str(s).endswith(".NS") else f"{s}.NS" for s in df["Symbol"].tolist()]
             logger.info(f"Loaded {len(symbols)} symbols from cache")
             return symbols
         except Exception as e:
-            logger.warning(f"Cache read failed: {e}")
+            logger.warning(f"Failed reading cache: {e}")
 
-    # Strong fallback list (liquid Nifty stocks)
+    # Solid liquid fallback (Nifty 50 style)
     fallback = [
         "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
         "HINDUNILVR.NS", "ITC.NS", "SBIN.NS", "BHARTIARTL.NS", "KOTAKBANK.NS",
@@ -34,30 +38,42 @@ def get_universe_symbols():
     return fallback
 
 
-def download_history(symbol: str, period: str = "1y", retries: int = 4):
-    """Robust download with retries and longer sleep."""
+def download_history(symbol: str, period: str = "5d", retries: int = 5):
+    """
+    More reliable way to get data on GitHub Actions.
+    Uses Ticker.history() instead of yf.download() + better retries.
+    """
     for attempt in range(1, retries + 1):
         try:
-            df = yf.download(
-                symbol,
-                period=period,
-                auto_adjust=True,
-                progress=False,
-                threads=False,
-                timeout=20
-            )
-            
-            if df is not None and not df.empty and len(df) > 40:
-                # Flatten multi-index columns if present
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(0)
-                df = df.dropna(how="all")
-                return df
-                
+            ticker = yf.Ticker(symbol)
+            df = ticker.history(period=period, auto_adjust=True)
+
+            if df is None or df.empty:
+                raise ValueError("Empty dataframe returned")
+
+            # Fix MultiIndex if present
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+
+            # Ensure we have Close
+            if "Close" not in df.columns:
+                raise ValueError("Close column missing")
+
+            return df
+
         except Exception as e:
-            logger.warning(f"{symbol} download attempt {attempt}/{retries} failed: {e}")
-        
-        time.sleep(1.5 * attempt)  # increasing delay
-    
-    logger.error(f"{symbol} → All download attempts failed")
+            logger.warning(f"{symbol} attempt {attempt}/{retries} failed: {e}")
+            time.sleep(2 * attempt)  # longer backoff
+
     return None
+
+
+def get_actual_close(symbol: str, retries: int = 5):
+    """Get the latest actual close + previous close."""
+    df = download_history(symbol, period="5d", retries=retries)
+    if df is None or df.empty:
+        return None, None
+
+    actual_close = float(df["Close"].iloc[-1])
+    prev_close = float(df["Close"].iloc[-2]) if len(df) >= 2 else actual_close
+    return actual_close, prev_close
