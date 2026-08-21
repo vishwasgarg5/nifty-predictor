@@ -32,7 +32,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
+def _universe_label() -> str:
+    """Safe label for Telegram (supports old & new config)."""
+    if hasattr(cfg, "universes"):
+        primary = getattr(cfg.universes, "primary", None)
+        if primary:
+            return "+".join(str(x).upper() for x in primary)
+    if hasattr(cfg, "universe"):
+        return str(cfg.universe).upper()
+    return "NIFTY"
+    
 def main():
     start_time = datetime.now()
     today_str = start_time.strftime("%Y-%m-%d")
@@ -109,7 +118,7 @@ def main():
         # 6. Telegram – clean table
         lines = [
             f"*TOP 5 STOCK PREDICTIONS*",
-            f"Date: `{today_str}` | Universe: `{cfg.universe.upper()}`",
+            f"Date: `{today_str}` | Universe: `{_universe_label()}`",
             "",
             "```",
             f"{'Stock':<12} {'Open':>8} {'High':>8} {'Low':>8} {'Close':>8}",
