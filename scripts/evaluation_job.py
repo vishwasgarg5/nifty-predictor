@@ -5,45 +5,28 @@ Evaluation Job.
 
 Pipeline
 --------
-1. Load the prediction ledger.
-2. Find predictions ready for evaluation.
-3. Fetch/resolve actual market outcomes.
-4. Update the prediction ledger.
-5. Generate evaluation metrics.
-6. Save the latest evaluation report.
-7. Run production monitoring.
-8. Update the circuit breaker through monitoring.
+1. Load prediction ledger.
+2. Ensure every record has a stable prediction_id.
+3. Find pending predictions.
+4. Resolve actual market outcomes.
+5. Merge outcomes using prediction_id.
+6. Save updated prediction ledger.
+7. Calculate evaluation metrics.
+8. Save latest evaluation report.
+9. Run production monitoring.
 
-This job does NOT send Telegram messages.
+IMPORTANT
+---------
+Ledger records are NEVER merged using DataFrame indexes.
 
-Expected flow:
+All outcome updates use:
 
-Prediction Ledger
-       │
-       ▼
-Find PENDING / WAITING predictions
-       │
-       ▼
-Resolve actual outcomes
-       │
-       ▼
-Update Ledger
-       │
-       ▼
-Model Evaluation
-       │
-       ▼
-Evaluation Report
-       │
-       ▼
-Production Monitoring
-       │
-       ▼
-Circuit Breaker
+    prediction_id
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import sys
 import traceback
@@ -86,13 +69,13 @@ logger = logging.getLogger("evaluation_job")
 # ============================================================
 
 def utc_now() -> datetime:
-    """Return the current UTC datetime."""
+    """Return current UTC datetime."""
 
     return datetime.now(timezone.utc)
 
 
 def utc_now_iso() -> str:
-    """Return the current UTC datetime as ISO text."""
+    """Return current UTC time as ISO string."""
 
     return utc_now().isoformat()
 
@@ -101,7 +84,9 @@ def utc_now_iso() -> str:
 # CONFIG HELPERS
 # ============================================================
 
-def object_to_dict(value: Any) -> dict[str, Any]:
+def object_to_dict(
+    value: Any,
+) -> dict[str, Any]:
     """Convert a config object into a dictionary."""
 
     if value is None:
@@ -111,12 +96,15 @@ def object_to_dict(value: Any) -> dict[str, Any]:
         return dict(value)
 
     if hasattr(value, "items"):
+
         try:
             return dict(value.items())
+
         except Exception:
             pass
 
     if hasattr(value, "__dict__"):
+
         return {
             key: item
             for key, item in vars(value).items()
@@ -138,7 +126,9 @@ def load_config() -> Any:
 # PATH HELPERS
 # ============================================================
 
-def resolve_path(value: str | Path) -> Path:
+def resolve_path(
+    value: str | Path,
+) -> Path:
     """Resolve a project-relative path."""
 
     path = Path(value)
@@ -156,7 +146,11 @@ def get_ledger_path() -> Path:
 
     candidates: list[Any] = []
 
-    for section_name in ["data", "paths"]:
+    for section_name in [
+        "ledger",
+        "data",
+        "paths",
+    ]:
 
         section = getattr(
             cfg,
@@ -167,13 +161,18 @@ def get_ledger_path() -> Path:
         values = object_to_dict(section)
 
         for key in [
+            "path",
             "prediction_ledger",
             "ledger",
         ]:
-            if values.get(key):
-                candidates.append(values[key])
+
+            value = values.get(key)
+
+            if value:
+                candidates.append(value)
 
     for candidate in candidates:
+
         return resolve_path(candidate)
 
     return (
@@ -189,7 +188,10 @@ def get_reports_dir() -> Path:
 
     cfg = load_config()
 
-    for section_name in ["data", "paths"]:
+    for section_name in [
+        "data",
+        "paths",
+    ]:
 
         section = getattr(
             cfg,
@@ -200,54 +202,199 @@ def get_reports_dir() -> Path:
         values = object_to_dict(section)
 
         for key in [
-            "reports",
             "reports_dir",
+            "reports",
         ]:
-            if values.get(key):
-                return resolve_path(
-                    values[key]
-                )
+
+            value = values.get(key)
+
+            if value:
+                return resolve_path(value)
 
     return PROJECT_ROOT / "data" / "reports"
 
 
 # ============================================================
-# DATA HELPERS
+# GENERIC HELPERS
 # ============================================================
 
 def find_column(
     frame: pd.DataFrame,
     candidates: list[str],
 ) -> str | None:
-    """Find the first matching column."""
+    """Find first existing column."""
 
     for column in candidates:
+
         if column in frame.columns:
             return column
 
     return None
 
 
-def to_numeric_series(
-    frame: pd.DataFrame,
-    column: str | None,
-) -> pd.Series:
-    """Safely convert a DataFrame column to numeric."""
+def normalize_value(
+    value: Any,
+) -> str:
+    """Normalize a value for ID generation."""
 
-    if column is None:
-        return pd.Series(
-            index=frame.index,
-            dtype="float64",
-        )
+    if value is None:
+        return ""
 
-    return pd.to_numeric(
-        frame[column],
-        errors="coerce",
-    )
+    if pd.isna(value):
+        return ""
+
+    return str(value).strip()
 
 
 # ============================================================
-# LOAD LEDGER
+# PREDICTION ID
+# ============================================================
+
+def generate_prediction_id(
+    row: pd.Series,
+) -> str:
+    """
+    Generate a stable prediction ID.
+
+    Primary identity:
+
+        market_date
+        symbol
+        model_version
+
+    The final ID is deterministic, meaning the
+    same prediction data generates the same ID.
+    """
+
+    market_date = ""
+
+    for column in [
+        "market_date",
+        "prediction_date",
+        "date",
+        "created_at",
+        "timestamp",
+    ]:
+
+        if column in row.index:
+
+            market_date = normalize_value(
+                row.get(column)
+            )
+
+            if market_date:
+                break
+
+    symbol = ""
+
+    for column in [
+        "symbol",
+        "ticker",
+        "stock",
+    ]:
+
+        if column in row.index:
+
+            symbol = normalize_value(
+                row.get(column)
+            ).upper()
+
+            if symbol:
+                break
+
+    model_version = ""
+
+    for column in [
+        "model_version",
+        "model_name",
+        "model",
+    ]:
+
+        if column in row.index:
+
+            model_version = normalize_value(
+                row.get(column)
+            )
+
+            if model_version:
+                break
+
+    raw_value = (
+        f"{market_date}|"
+        f"{symbol}|"
+        f"{model_version}"
+    )
+
+    return hashlib.sha256(
+        raw_value.encode("utf-8")
+    ).hexdigest()[:24]
+
+
+def ensure_prediction_ids(
+    ledger: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Ensure every ledger record has prediction_id.
+
+    Existing IDs are preserved.
+    Missing IDs are generated.
+    """
+
+    if ledger.empty:
+        return ledger.copy()
+
+    result = ledger.copy()
+
+    if "prediction_id" not in result.columns:
+
+        result["prediction_id"] = pd.NA
+
+    missing_mask = (
+        result["prediction_id"].isna()
+        |
+        result["prediction_id"]
+        .astype(str)
+        .str.strip()
+        .eq("")
+    )
+
+    missing_count = int(
+        missing_mask.sum()
+    )
+
+    if missing_count == 0:
+        return result
+
+    logger.info(
+        "Generating %s missing prediction_id value(s).",
+        missing_count,
+    )
+
+    for index in result.index:
+
+        current_id = result.at[
+            index,
+            "prediction_id",
+        ]
+
+        if (
+            pd.notna(current_id)
+            and str(current_id).strip()
+        ):
+            continue
+
+        result.at[
+            index,
+            "prediction_id",
+        ] = generate_prediction_id(
+            result.loc[index]
+        )
+
+    return result
+
+
+# ============================================================
+# LOAD / SAVE LEDGER
 # ============================================================
 
 def load_prediction_ledger() -> pd.DataFrame:
@@ -266,14 +413,18 @@ def load_prediction_ledger() -> pd.DataFrame:
 
     try:
 
-        frame = pd.read_csv(path)
+        ledger = pd.read_csv(path)
+
+        ledger = ensure_prediction_ids(
+            ledger
+        )
 
         logger.info(
             "Loaded %s ledger record(s).",
-            len(frame),
+            len(ledger),
         )
 
-        return frame
+        return ledger
 
     except pd.errors.EmptyDataError:
 
@@ -282,14 +433,14 @@ def load_prediction_ledger() -> pd.DataFrame:
     except Exception as error:
 
         raise RuntimeError(
-            f"Could not load ledger: {error}"
+            f"Could not load prediction ledger: {error}"
         ) from error
 
 
 def save_prediction_ledger(
-    frame: pd.DataFrame,
+    ledger: pd.DataFrame,
 ) -> Path:
-    """Save the updated prediction ledger."""
+    """Save prediction ledger."""
 
     path = get_ledger_path()
 
@@ -298,13 +449,13 @@ def save_prediction_ledger(
         exist_ok=True,
     )
 
-    frame.to_csv(
+    ledger.to_csv(
         path,
         index=False,
     )
 
     logger.info(
-        "Saved updated prediction ledger: %s",
+        "Saved prediction ledger: %s",
         path,
     )
 
@@ -312,7 +463,7 @@ def save_prediction_ledger(
 
 
 # ============================================================
-# FIND PREDICTIONS READY FOR EVALUATION
+# PENDING PREDICTIONS
 # ============================================================
 
 def get_pending_predictions(
@@ -331,180 +482,106 @@ def get_pending_predictions(
     if ledger.empty:
         return ledger.copy()
 
-    if "evaluation_status" not in ledger.columns:
+    result = ledger.copy()
 
-        result = ledger.copy()
+    if "evaluation_status" not in result.columns:
 
-        result["evaluation_status"] = (
-            "PENDING"
-        )
-
-        return result
+        result["evaluation_status"] = "PENDING"
 
     status = (
-        ledger["evaluation_status"]
+        result["evaluation_status"]
         .fillna("PENDING")
         .astype(str)
         .str.upper()
+        .str.strip()
     )
 
-    mask = status.isin(
-        [
-            "PENDING",
-            "WAITING",
-            "UNEVALUATED",
-        ]
-    )
+    pending_statuses = [
+        "PENDING",
+        "WAITING",
+        "UNEVALUATED",
+    ]
 
-    return ledger.loc[
-        mask
+    return result.loc[
+        status.isin(
+            pending_statuses
+        )
     ].copy()
 
 
 # ============================================================
-# ACTUAL OUTCOME RESOLUTION
+# ACTUAL OUTCOMES
 # ============================================================
 
 def resolve_actual_outcomes(
-    pending: pd.DataFrame,
+    predictions: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Resolve actual outcomes for pending predictions.
+    Resolve actual outcomes.
 
-    This function attempts to use an existing project
-    outcome/evaluation module.
+    Expected return columns:
 
-    Supported module patterns:
-
-        src.evaluation.resolve_actual_outcomes(df)
-        src.evaluation.evaluate_predictions(df)
-        src.actuals.resolve_actual_outcomes(df)
-        src.actuals.fetch_actuals(df)
-
-    The returned DataFrame should contain one or more of:
-
+        prediction_id
         actual_return
         actual_direction
         actual_risk
         evaluation_status
     """
 
-    if pending.empty:
-        return pending.copy()
-
-    attempts: list[str] = []
-
-    # --------------------------------------------------------
-    # src.evaluation
-    # --------------------------------------------------------
+    if predictions.empty:
+        return predictions.copy()
 
     try:
 
-        from src import evaluation
+        from src.actuals import (
+            resolve_actual_outcomes as resolver,
+        )
 
-        for function_name in [
-            "resolve_actual_outcomes",
-            "evaluate_predictions",
-        ]:
+        logger.info(
+            "Resolving actual market outcomes."
+        )
 
-            function = getattr(
-                evaluation,
-                function_name,
-                None,
+        outcomes = resolver(
+            predictions.copy()
+        )
+
+        if not isinstance(
+            outcomes,
+            pd.DataFrame,
+        ):
+
+            raise TypeError(
+                "Actual outcome resolver must return "
+                "a pandas DataFrame."
             )
 
-            if callable(function):
+        outcomes = ensure_prediction_ids(
+            outcomes
+        )
 
-                logger.info(
-                    "Using src.evaluation.%s()",
-                    function_name,
-                )
-
-                result = function(
-                    pending.copy()
-                )
-
-                if isinstance(
-                    result,
-                    pd.DataFrame,
-                ):
-                    return result
-
-                if isinstance(result, dict):
-                    return pd.DataFrame(
-                        [result]
-                    )
+        return outcomes
 
     except Exception as error:
 
-        attempts.append(
-            f"src.evaluation: {error}"
+        logger.exception(
+            "Actual outcome resolution failed."
         )
 
-    # --------------------------------------------------------
-    # src.actuals
-    # --------------------------------------------------------
+        result = predictions.copy()
 
-    try:
-
-        from src import actuals
-
-        for function_name in [
-            "resolve_actual_outcomes",
-            "fetch_actuals",
-        ]:
-
-            function = getattr(
-                actuals,
-                function_name,
-                None,
-            )
-
-            if callable(function):
-
-                logger.info(
-                    "Using src.actuals.%s()",
-                    function_name,
-                )
-
-                result = function(
-                    pending.copy()
-                )
-
-                if isinstance(
-                    result,
-                    pd.DataFrame,
-                ):
-                    return result
-
-                if isinstance(result, dict):
-                    return pd.DataFrame(
-                        [result]
-                    )
-
-    except Exception as error:
-
-        attempts.append(
-            f"src.actuals: {error}"
+        result["evaluation_status"] = (
+            "WAITING"
         )
 
-    logger.warning(
-        "No actual outcome resolver was available. "
-        "Predictions remain WAITING. Attempts: %s",
-        " | ".join(attempts),
-    )
+        result["evaluation_error"] = (
+            f"Outcome resolution failed: {error}"
+        )
 
-    result = pending.copy()
-
-    result["evaluation_status"] = (
-        "WAITING"
-    )
-
-    return result
+        return result
 
 
 # ============================================================
-# UPDATE LEDGER
+# MERGE OUTCOMES BY PREDICTION ID
 # ============================================================
 
 def update_ledger_with_actuals(
@@ -512,96 +589,109 @@ def update_ledger_with_actuals(
     outcomes: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Merge actual outcomes back into the prediction ledger.
+    Update prediction ledger using stable prediction_id.
 
-    Uses index alignment when possible.
+    DataFrame indexes are NEVER used for merging.
     """
 
-    if ledger.empty or outcomes.empty:
+    if ledger.empty:
         return ledger.copy()
 
-    updated = ledger.copy()
+    updated = ensure_prediction_ids(
+        ledger
+    )
+
+    if outcomes.empty:
+        return updated
+
+    outcomes = ensure_prediction_ids(
+        outcomes
+    )
+
+    if "prediction_id" not in outcomes.columns:
+
+        raise ValueError(
+            "Actual outcomes do not contain prediction_id."
+        )
 
     outcome_columns = [
         "actual_return",
         "actual_direction",
         "actual_risk",
         "evaluation_status",
+        "evaluation_timestamp",
+        "evaluation_error",
+        "exit_price",
+        "exit_timestamp",
     ]
 
-    for column in outcome_columns:
+    available_columns = [
+        column
+        for column in outcome_columns
+        if column in outcomes.columns
+    ]
 
-        if column not in outcomes.columns:
-            continue
+    if not available_columns:
+
+        logger.warning(
+            "No outcome columns available for merge."
+        )
+
+        return updated
+
+    outcome_map = (
+        outcomes[
+            ["prediction_id"]
+            + available_columns
+        ]
+        .drop_duplicates(
+            subset=["prediction_id"],
+            keep="last",
+        )
+        .set_index(
+            "prediction_id"
+        )
+    )
+
+    for column in available_columns:
 
         if column not in updated.columns:
 
             updated[column] = pd.NA
 
-        for index in outcomes.index:
-
-            if index in updated.index:
-
-                value = outcomes.at[
-                    index,
-                    column,
-                ]
-
-                if pd.notna(value):
-
-                    updated.at[
-                        index,
-                        column,
-                    ] = value
-
-    if "evaluation_status" not in updated.columns:
-
-        updated["evaluation_status"] = (
-            "PENDING"
-        )
-
-    actual_return_column = (
-        "actual_return"
-        if "actual_return" in updated.columns
-        else None
-    )
-
-    if actual_return_column:
-
-        has_actual = (
-            pd.to_numeric(
-                updated[actual_return_column],
-                errors="coerce",
+        mapped_values = (
+            updated["prediction_id"]
+            .map(
+                outcome_map[column]
             )
-            .notna()
         )
+
+        has_value = mapped_values.notna()
 
         updated.loc[
-            has_actual,
-            "evaluation_status",
-        ] = "EVALUATED"
+            has_value,
+            column,
+        ] = mapped_values.loc[
+            has_value
+        ]
+
+    logger.info(
+        "Merged outcomes using prediction_id | "
+        "outcomes=%s",
+        len(outcome_map),
+    )
 
     return updated
 
 
 # ============================================================
-# METRIC CALCULATION
+# EVALUATION METRICS
 # ============================================================
 
 def calculate_evaluation_metrics(
     ledger: pd.DataFrame,
 ) -> dict[str, Any]:
-    """
-    Calculate production evaluation metrics.
-
-    Metrics:
-
-        sample_count
-        return_mae
-        direction_accuracy
-        brier_score
-        risk_mae
-    """
+    """Calculate evaluation metrics."""
 
     result: dict[str, Any] = {
         "model_name": "ALL",
@@ -615,10 +705,6 @@ def calculate_evaluation_metrics(
     if ledger.empty:
         return result
 
-    # --------------------------------------------------------
-    # FILTER EVALUATED RECORDS
-    # --------------------------------------------------------
-
     evaluated = ledger.copy()
 
     if "evaluation_status" in evaluated.columns:
@@ -628,6 +714,7 @@ def calculate_evaluation_metrics(
             .fillna("")
             .astype(str)
             .str.upper()
+            .str.strip()
         )
 
         evaluated = evaluated.loc[
@@ -666,14 +753,14 @@ def calculate_evaluation_metrics(
         and actual_return_column
     ):
 
-        predicted = to_numeric_series(
-            evaluated,
-            predicted_return_column,
+        predicted = pd.to_numeric(
+            evaluated[predicted_return_column],
+            errors="coerce",
         )
 
-        actual = to_numeric_series(
-            evaluated,
-            actual_return_column,
+        actual = pd.to_numeric(
+            evaluated[actual_return_column],
+            errors="coerce",
         )
 
         valid = (
@@ -717,7 +804,7 @@ def calculate_evaluation_metrics(
         and actual_direction_column
     ):
 
-        predicted_direction = (
+        predicted = (
             evaluated[
                 predicted_direction_column
             ]
@@ -726,7 +813,7 @@ def calculate_evaluation_metrics(
             .str.strip()
         )
 
-        actual_direction = (
+        actual = (
             evaluated[
                 actual_direction_column
             ]
@@ -739,7 +826,8 @@ def calculate_evaluation_metrics(
             evaluated[
                 predicted_direction_column
             ].notna()
-            & evaluated[
+            &
+            evaluated[
                 actual_direction_column
             ].notna()
         )
@@ -750,8 +838,8 @@ def calculate_evaluation_metrics(
                 "direction_accuracy"
             ] = float(
                 (
-                    predicted_direction[valid]
-                    == actual_direction[valid]
+                    predicted[valid]
+                    == actual[valid]
                 )
                 .mean()
             )
@@ -775,12 +863,12 @@ def calculate_evaluation_metrics(
         and actual_direction_column
     ):
 
-        confidence = to_numeric_series(
-            evaluated,
-            confidence_column,
+        confidence = pd.to_numeric(
+            evaluated[confidence_column],
+            errors="coerce",
         )
 
-        predicted_direction = (
+        predicted = (
             evaluated[
                 predicted_direction_column
             ]
@@ -789,7 +877,7 @@ def calculate_evaluation_metrics(
             .str.strip()
         )
 
-        actual_direction = (
+        actual = (
             evaluated[
                 actual_direction_column
             ]
@@ -800,22 +888,23 @@ def calculate_evaluation_metrics(
 
         valid = (
             confidence.notna()
-            & evaluated[
+            &
+            evaluated[
                 predicted_direction_column
             ].notna()
-            & evaluated[
+            &
+            evaluated[
                 actual_direction_column
             ].notna()
         )
 
         if valid.any():
 
-            probabilities = confidence[
-                valid
-            ].copy()
+            probabilities = (
+                confidence[valid]
+                .copy()
+            )
 
-            # Convert percentage confidence
-            # such as 75 -> 0.75.
             if probabilities.max() > 1:
                 probabilities = (
                     probabilities / 100.0
@@ -826,15 +915,15 @@ def calculate_evaluation_metrics(
                 upper=1.0,
             )
 
-            actual_correct = (
-                predicted_direction[valid]
-                == actual_direction[valid]
+            correct = (
+                predicted[valid]
+                == actual[valid]
             ).astype(float)
 
             result["brier_score"] = float(
                 (
                     probabilities
-                    - actual_correct
+                    - correct
                 )
                 .pow(2)
                 .mean()
@@ -865,27 +954,27 @@ def calculate_evaluation_metrics(
         and actual_risk_column
     ):
 
-        predicted_risk = to_numeric_series(
-            evaluated,
-            predicted_risk_column,
+        predicted = pd.to_numeric(
+            evaluated[predicted_risk_column],
+            errors="coerce",
         )
 
-        actual_risk = to_numeric_series(
-            evaluated,
-            actual_risk_column,
+        actual = pd.to_numeric(
+            evaluated[actual_risk_column],
+            errors="coerce",
         )
 
         valid = (
-            predicted_risk.notna()
-            & actual_risk.notna()
+            predicted.notna()
+            & actual.notna()
         )
 
         if valid.any():
 
             result["risk_mae"] = float(
                 (
-                    predicted_risk[valid]
-                    - actual_risk[valid]
+                    predicted[valid]
+                    - actual[valid]
                 )
                 .abs()
                 .mean()
@@ -901,11 +990,7 @@ def calculate_evaluation_metrics(
 def save_evaluation_report(
     metrics: dict[str, Any],
 ) -> Path:
-    """
-    Save latest evaluation report.
-
-    Required by src.monitoring.
-    """
+    """Save latest evaluation report."""
 
     reports_dir = get_reports_dir()
 
@@ -941,22 +1026,11 @@ def save_evaluation_report(
 
 
 # ============================================================
-# RUN MONITORING
+# MONITORING
 # ============================================================
 
 def run_production_monitoring() -> dict[str, Any]:
-    """
-    Run monitoring after evaluation.
-
-    Monitoring automatically checks:
-
-        - evaluation quality
-        - stale data
-        - model registry
-        - ledger health
-
-    It then updates the circuit breaker.
-    """
+    """Run production monitoring."""
 
     try:
 
@@ -964,19 +1038,16 @@ def run_production_monitoring() -> dict[str, Any]:
             run_monitoring,
         )
 
-        logger.info(
-            "Running production monitoring."
-        )
-
         result = run_monitoring()
 
-        if isinstance(result, dict):
+        if isinstance(
+            result,
+            dict,
+        ):
             return result
 
         return {
             "status": "UNKNOWN",
-            "health_status": "UNKNOWN",
-            "health_score": None,
         }
 
     except Exception as error:
@@ -998,9 +1069,7 @@ def run_production_monitoring() -> dict[str, Any]:
 # ============================================================
 
 def run_evaluation_job() -> dict[str, Any]:
-    """
-    Run the complete evaluation pipeline.
-    """
+    """Run complete evaluation pipeline."""
 
     result: dict[str, Any] = {
         "started_at": utc_now_iso(),
@@ -1014,31 +1083,14 @@ def run_evaluation_job() -> dict[str, Any]:
         "error": None,
     }
 
-    logger.info(
-        "=" * 70
-    )
-
-    logger.info(
-        "STARTING EVALUATION JOB"
-    )
-
-    logger.info(
-        "=" * 70
-    )
-
     try:
 
-        # ----------------------------------------------------
-        # STEP 1: LOAD LEDGER
-        # ----------------------------------------------------
-
         logger.info(
-            "Step 1: Loading prediction ledger."
+            "Starting evaluation job."
         )
 
-        ledger = (
-            load_prediction_ledger()
-        )
+        # Step 1
+        ledger = load_prediction_ledger()
 
         result["ledger_records"] = len(
             ledger
@@ -1048,59 +1100,27 @@ def run_evaluation_job() -> dict[str, Any]:
 
             result["status"] = "NO_LEDGER_DATA"
 
-            logger.warning(
-                "No ledger records available."
-            )
-
             return result
 
-        # ----------------------------------------------------
-        # STEP 2: FIND PENDING PREDICTIONS
-        # ----------------------------------------------------
+        # Save generated IDs immediately.
+        save_prediction_ledger(ledger)
 
-        logger.info(
-            "Step 2: Finding predictions "
-            "ready for evaluation."
-        )
-
-        pending = (
-            get_pending_predictions(
-                ledger
-            )
+        # Step 2
+        pending = get_pending_predictions(
+            ledger
         )
 
         result[
             "pending_predictions"
         ] = len(pending)
 
-        if pending.empty:
-
-            logger.info(
-                "No pending predictions found."
-            )
-
-        else:
-
-            # ------------------------------------------------
-            # STEP 3: RESOLVE ACTUAL OUTCOMES
-            # ------------------------------------------------
-
-            logger.info(
-                "Step 3: Resolving actual outcomes."
-            )
+        # Step 3 and 4
+        if not pending.empty:
 
             outcomes = (
                 resolve_actual_outcomes(
                     pending
                 )
-            )
-
-            # ------------------------------------------------
-            # STEP 4: UPDATE LEDGER
-            # ------------------------------------------------
-
-            logger.info(
-                "Step 4: Updating prediction ledger."
             )
 
             ledger = (
@@ -1114,14 +1134,7 @@ def run_evaluation_job() -> dict[str, Any]:
                 ledger
             )
 
-        # ----------------------------------------------------
-        # STEP 5: CALCULATE METRICS
-        # ----------------------------------------------------
-
-        logger.info(
-            "Step 5: Calculating evaluation metrics."
-        )
-
+        # Step 5
         metrics = (
             calculate_evaluation_metrics(
                 ledger
@@ -1137,14 +1150,7 @@ def run_evaluation_job() -> dict[str, Any]:
             0,
         )
 
-        # ----------------------------------------------------
-        # STEP 6: SAVE EVALUATION REPORT
-        # ----------------------------------------------------
-
-        logger.info(
-            "Step 6: Saving evaluation report."
-        )
-
+        # Step 6
         report_path = (
             save_evaluation_report(
                 metrics
@@ -1155,14 +1161,7 @@ def run_evaluation_job() -> dict[str, Any]:
             report_path
         )
 
-        # ----------------------------------------------------
-        # STEP 7: RUN MONITORING
-        # ----------------------------------------------------
-
-        logger.info(
-            "Step 7: Running production monitoring."
-        )
-
+        # Step 7
         monitoring = (
             run_production_monitoring()
         )
@@ -1183,15 +1182,12 @@ def run_evaluation_job() -> dict[str, Any]:
 
         result["status"] = "FAILED"
 
-        result["error"] = str(
-            error
-        )
+        result["error"] = str(error)
 
         result["traceback"] = (
             traceback.format_exc()
         )
 
-        # Fail-safe circuit breaker registration.
         try:
 
             from src.circuit_breaker import (
@@ -1210,8 +1206,7 @@ def run_evaluation_job() -> dict[str, Any]:
         except Exception as breaker_error:
 
             logger.error(
-                "Could not register evaluation "
-                "failure with circuit breaker: %s",
+                "Circuit breaker update failed: %s",
                 breaker_error,
             )
 
@@ -1224,16 +1219,8 @@ def run_evaluation_job() -> dict[str, Any]:
         )
 
         logger.info(
-            "=" * 70
-        )
-
-        logger.info(
-            "EVALUATION JOB FINISHED | STATUS=%s",
+            "Evaluation job finished | status=%s",
             result.get("status"),
-        )
-
-        logger.info(
-            "=" * 70
         )
 
 
@@ -1242,7 +1229,6 @@ def run_evaluation_job() -> dict[str, Any]:
 # ============================================================
 
 def main() -> int:
-    """CLI entry point."""
 
     result = run_evaluation_job()
 
@@ -1254,96 +1240,12 @@ def main() -> int:
 
     print("=" * 70)
 
-    print(
-        "Status: "
-        f"{result.get('status')}"
-    )
+    for key, value in result.items():
 
-    print(
-        "Ledger records: "
-        f"{result.get('ledger_records')}"
-    )
+        if key == "traceback":
+            continue
 
-    print(
-        "Pending predictions: "
-        f"{result.get('pending_predictions')}"
-    )
-
-    print(
-        "Evaluated predictions: "
-        f"{result.get('evaluated_predictions')}"
-    )
-
-    metrics = result.get(
-        "metrics",
-        {},
-    )
-
-    if metrics:
-
-        print()
-
-        print("METRICS")
-
-        for key in [
-            "sample_count",
-            "return_mae",
-            "direction_accuracy",
-            "brier_score",
-            "risk_mae",
-        ]:
-
-            print(
-                f"{key}: "
-                f"{metrics.get(key)}"
-            )
-
-    monitoring = result.get(
-        "monitoring",
-        {},
-    )
-
-    if monitoring:
-
-        print()
-
-        print("SYSTEM HEALTH")
-
-        print(
-            "Status: "
-            f"{monitoring.get('health_status')}"
-        )
-
-        print(
-            "Score: "
-            f"{monitoring.get('health_score')}"
-        )
-
-        breaker = monitoring.get(
-            "circuit_breaker",
-            {},
-        )
-
-        if breaker:
-
-            print(
-                "Circuit Breaker: "
-                f"{breaker.get('state')}"
-            )
-
-            print(
-                "Predictions Allowed: "
-                f"{breaker.get('predictions_allowed')}"
-            )
-
-    if result.get("error"):
-
-        print()
-
-        print(
-            "ERROR: "
-            f"{result.get('error')}"
-        )
+        print(f"{key}: {value}")
 
     return (
         0
