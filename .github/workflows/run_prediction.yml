@@ -1,0 +1,152 @@
+name: Run Prediction Pipeline
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    # Monday to Friday at 3:30 AM UTC
+    # 9:00 AM IST
+    - cron: "30 3 * * 1-5"
+
+permissions:
+  contents: write
+
+jobs:
+  run-prediction:
+    name: Run Market Prediction Pipeline
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 30
+
+    steps:
+
+      # ======================================================
+      # CHECKOUT REPOSITORY
+      # ======================================================
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+        with:
+          fetch-depth: 0
+
+
+      # ======================================================
+      # SETUP PYTHON
+      # ======================================================
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+
+        with:
+          python-version: "3.11"
+
+
+      # ======================================================
+      # CACHE PYTHON PACKAGES
+      # ======================================================
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+
+        with:
+          path: ~/.cache/pip
+
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+
+      # ======================================================
+      # INSTALL DEPENDENCIES
+      # ======================================================
+
+      - name: Upgrade pip
+        run: |
+          python -m pip install --upgrade pip
+
+
+      - name: Install project dependencies
+        run: |
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            echo "requirements.txt not found"
+            exit 1
+          fi
+
+
+      # ======================================================
+      # VERIFY PROJECT
+      # ======================================================
+
+      - name: Show project structure
+        run: |
+          echo "Current directory:"
+          pwd
+
+          echo ""
+          echo "Project files:"
+          find . -maxdepth 3 -type f | sort
+
+
+      - name: Verify Python
+        run: |
+          python --version
+
+          python -c "import pandas; print('pandas OK')"
+
+
+      # ======================================================
+      # RUN PREDICTION PIPELINE
+      # ======================================================
+
+      - name: Run Prediction Pipeline
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+
+          # Telegram secrets
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+        run: |
+          echo "=============================================="
+          echo "STARTING PREDICTION PIPELINE"
+          echo "=============================================="
+
+          python -m src.prediction_pipeline
+
+          echo "=============================================="
+          echo "PREDICTION PIPELINE FINISHED"
+          echo "=============================================="
+
+
+      # ======================================================
+      # SAVE GENERATED DATA
+      # ======================================================
+
+      - name: Check for generated files
+        run: |
+          echo "Checking generated data..."
+
+          find data -type f 2>/dev/null || true
+
+
+      # ======================================================
+      # COMMIT UPDATED FILES
+      # ======================================================
+
+      - name: Commit prediction results
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add data/ || true
+
+          if git diff --cached --quiet; then
+            echo "No prediction data changes to commit."
+          else
+            git commit -m "chore: update prediction pipeline data"
+            git push
+          fi
