@@ -2,19 +2,19 @@ name: Evening - Actual vs Predicted
 
 on:
   schedule:
-    # 16:15 IST = 10:45 UTC (Monday to Friday)
+    # 16:15 IST = 10:45 UTC (Mon–Fri)
     - cron: '45 10 * * 1-5'
   workflow_dispatch:
 
 jobs:
-  evening-job:
+  evening:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
     permissions:
       contents: write
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Python 3.11
