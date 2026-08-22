@@ -1,62 +1,131 @@
 universes:
-  primary: [nifty100, nifty500]
-  secondary: [midcap150]
+  primary:
+    - nifty100
+    - nifty500
+
+  secondary:
+    - midcap150
+
   include_ipo: true
   ipo_min_trading_days: 30
   ipo_min_avg_volume: 100000
 
+
 indexes:
   enabled: true
+
   list:
-    - {symbol: "^NSEI", name: "NIFTY50"}
-    - {symbol: "^BSESN", name: "SENSEX"}
-    - {symbol: "^NSEBANK", name: "BANKNIFTY"}
-    - {symbol: "^CNXIT", name: "NIFTY_IT"}
+    - symbol: "^NSEI"
+      name: "NIFTY50"
+
+    - symbol: "^BSESN"
+      name: "SENSEX"
+
+    - symbol: "^NSEBANK"
+      name: "BANKNIFTY"
+
+    - symbol: "^CNXIT"
+      name: "NIFTY_IT"
+
 
 ipo_desk:
   enabled: true
   max_rows: 10
 
+
 top_n: 5
+
+
 lookback_days: 180
+
+
 min_history_days: 60
 
+
 scoring:
+
   rsi_oversold: 42
+
   volume_spike: 1.15
+
   pe_max: 55
+
   pb_max: 10
+
   roe_min: 0.08
+
   min_avg_volume: 100000
+
   max_atr_pct: 8.0
+
   prefilter_top: 40
+
   stage1_limit: 220
-  weights: {technical: 0.70, fundamental: 0.30}
+
+  weights:
+    technical: 0.70
+    fundamental: 0.30
+
+
+# Version of the feature pipeline.
+feature_version: "features-v1"
+
 
 model:
+
+  # Increment this whenever the model logic changes.
+  version: "ohlc-v1"
+
   n_estimators: 120
+
   max_depth: 4
+
   learning_rate: 0.05
 
+
 drift:
+
   mape_threshold: 3.5
+
   dir_acc_threshold: 52
+
   lookback_days: 10
+
 
 tuning:
   enabled: true
 
+
 sentiment:
+
   max_articles: 6
+
   use_finbert: true
 
+
 paths:
-  predictions: data/predictions
-  history: data/history
-  models: models
-  universes_dir: data/universes
-  errors_file: data/history/daily_errors.csv
-  weekly_file: data/history/weekly_reports.csv
-  drift_file: data/history/drift_log.csv
-  ipo_file: data/universes/ipo_watchlist.csv
-  ipo_pipeline: data/ipo_pipeline.csv
+
+  predictions: "data/predictions"
+
+  history: "data/history"
+
+  models: "models"
+
+  universes_dir: "data/universes"
+
+  # Old file retained for backward compatibility.
+  errors_file: "data/history/daily_errors.csv"
+
+  # New immutable prediction ledger.
+  ledger_file: "data/predictions/prediction_ledger.csv"
+
+  # Daily model evaluation metrics.
+  metrics_file: "data/evaluation/model_metrics.csv"
+
+  weekly_file: "data/history/weekly_reports.csv"
+
+  drift_file: "data/history/drift_log.csv"
+
+  ipo_file: "data/universes/ipo_watchlist.csv"
+
+  ipo_pipeline: "data/ipo_pipeline.csv"
