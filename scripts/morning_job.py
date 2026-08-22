@@ -1,1076 +1,1463 @@
+#!/usr/bin/env python3
 
-                "symbol"
-            )
+"""
+Morning Prediction Pipeline.
 
-            if not symbol:
+Pipeline
+--------
+1. Run market prediction pipeline.
+2. Generate ranked opportunities.
+3. Save predictions to the prediction ledger.
+4. Run production monitoring.
+5. Check the circuit breaker.
+6. Send predictions to Telegram only when allowed.
 
-                continue
+Important:
+----------
+A circuit breaker block does NOT stop prediction generation
+or ledger recording. It only blocks Telegram delivery.
+"""
 
-            # Only evaluate stocks with
-            # trained models.
-            if not model_store.exists(
-                symbol
-            ):
+from __future__ import annotations
 
-                logger.info(
-                    "%s skipped: no saved model",
-                    symbol,
-                )
+import logging
+import os
+import sys
+import traceback
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
-                continue
+import pandas as pd
 
-            metadata = (
-                build_stock_features(
-                    symbol
-                )
-            )
 
-            quality = metadata.get(
-                "quality",
-                0.0,
-            )
+# ============================================================
+# PROJECT ROOT
+# ============================================================
 
-            if quality < minimum_quality:
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-                logger.info(
-                    "%s rejected by feature "
-                    "quality: %.2f < %.2f",
-                    symbol,
-                    quality,
-                    minimum_quality,
-                )
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-                continue
 
-            enriched_candidates.append(
+# ============================================================
+# LOGGING
+# ============================================================
 
-                {
+logging.basicConfig(
+    level=logging.INFO,
+    format=(
+        "%(asctime)s | "
+        "%(levelname)s | "
+        "%(name)s | "
+        "%(message)s"
+    ),
+)
 
-                    "symbol": symbol,
+logger = logging.getLogger("morning_job")
 
-                    "technical_score": float(
-                        row.get(
-                            "score",
-                            0.0,
-                        )
-                    ),
 
-                    "feature_quality": (
-                        quality
-                    ),
+# ============================================================
+# TIME HELPERS
+# ============================================================
 
-                    "features": (
-                        metadata.get(
-                            "features"
-                        )
-                    ),
-                }
-            )
+def utc_now() -> datetime:
+    """Return the current UTC datetime."""
 
+    return datetime.now(timezone.utc)
 
-        if not enriched_candidates:
 
-            logger.warning(
-                "No candidates passed feature quality."
-            )
+def utc_now_iso() -> str:
+    """Return the current UTC datetime as ISO text."""
 
-            send_telegram(
-                f"⚠️ All candidates failed "
-                f"feature quality for `{today}`"
-            )
+    return utc_now().isoformat()
 
-            return 0
 
+# ============================================================
+# CONFIG HELPERS
+# ============================================================
 
-        logger.info(
-            "Feature quality survivors: %s",
-            len(enriched_candidates),
-        )
+def object_to_dict(
+    value: Any,
+) -> dict[str, Any]:
+    """
+    Convert configuration objects into dictionaries.
+    """
 
+    if value is None:
+        return {}
 
-        # ====================================================
-        # STEP 6 — PARALLEL CHALLENGER PREDICTIONS
-        # ====================================================
+    if isinstance(value, dict):
+        return dict(value)
 
-        challenger_predictions, challenger_summaries = (
-            run_challenger_predictions(
-                enriched_candidates=enriched_candidates,
-                prediction_date=today,
-            )
-        )
-
-        for summary in challenger_summaries:
-            logger.info(
-                "Parallel model | model=%s | success=%s | predictions=%s | error=%s",
-                summary.get("model_name"), summary.get("success"),
-                summary.get("prediction_count"), summary.get("error"),
-            )
-
-
-        # ====================================================
-        # STEP 7 — SAVED MODEL INFERENCE (CHAMPION)
-        # ====================================================
-
-        ml_candidates: list[
-            dict
-        ] = []
-
-        for candidate in enriched_candidates:
-
-            symbol = candidate[
-                "symbol"
-            ]
-
-            prediction = (
-                get_ml_prediction(
-
-                    symbol=symbol,
-
-                    store=model_store,
-                )
-            )
-
-            if not prediction:
-
-                continue
-
-            candidate[
-                "ml_prediction"
-            ] = prediction
-
-            candidate[
-                "opportunity_score"
-            ] = float(
-                prediction.get(
-                    "opportunity_score",
-                    0.0,
-                )
-            )
-
-            candidate[
-                "confidence"
-            ] = float(
-                prediction.get(
-                    "confidence",
-                    0.0,
-                )
-            )
-
-            base_score = (
-                calculate_final_score(
-
-                    technical_score=(
-                        candidate[
-                            "technical_score"
-                        ]
-                    ),
-
-                    opportunity_score=(
-                        candidate[
-                            "opportunity_score"
-                        ]
-                    ),
-
-                    confidence=(
-                        candidate[
-                            "confidence"
-                        ]
-                    ),
-
-                    feature_quality=(
-                        candidate[
-                            "feature_quality"
-                        ]
-                    ),
-                )
-            )
-
-            candidate[
-                "final_score"
-            ] = apply_market_regime_adjustment(
-
-                score=base_score,
-
-                prediction=prediction,
-
-                regime=market_regime,
-            )
-
-            if not quality_gate(
-                candidate,
-                minimum_quality,
-            ):
-
-                logger.info(
-                    "%s rejected by "
-                    "quality gate",
-                    symbol,
-                )
-
-                continue
-
-            ml_candidates.append(
-                candidate
-            )
-
-
-        if not ml_candidates:
-
-            logger.warning(
-                "No ML candidates survived."
-            )
-
-            send_telegram(
-                f"⚠️ No ML candidates survived "
-                f"quality gate for `{today}`"
-            )
-
-            return 0
-
-
-        # ====================================================
-        # STEP 7 — FINAL RANKING
-        # ====================================================
-
-        ml_candidates.sort(
-
-            key=lambda item: item[
-                "final_score"
-            ],
-
-            reverse=True,
-        )
-
-        top_n = get_top_n()
-
-        final_candidates = (
-            ml_candidates[:top_n]
-        )
-
-        logger.info(
-            "FINAL TOP %s: %s",
-
-            len(final_candidates),
-
-            ", ".join(
-
-                item["symbol"]
-
-                for item
-                in final_candidates
-            ),
-        )
-
-
-        # ====================================================
-        # STEP 8 — OHLC PREDICTIONS
-        # ====================================================
-
-        records: list[
-            dict
-        ] = []
-
-        for candidate in final_candidates:
-
-            symbol = candidate[
-                "symbol"
-            ]
-
-            try:
-
-                predictor = (
-                    OHLCPredictor(
-                        symbol
-                    )
-                )
-
-                ohlc = (
-                    predictor.predict_next()
-                )
-
-                if not ohlc:
-
-                    logger.warning(
-                        "No OHLC prediction for %s",
-                        symbol,
-                    )
-
-                    continue
-
-                ml = candidate[
-                    "ml_prediction"
-                ]
-
-                record = {
-
-                    "date": today,
-
-                    "symbol": symbol,
-
-                    # Traditional score
-                    "technical_score": (
-                        candidate[
-                            "technical_score"
-                        ]
-                    ),
-
-                    # Feature quality
-                    "feature_quality": (
-                        candidate[
-                            "feature_quality"
-                        ]
-                    ),
-
-                    # Multi-model outputs
-                    "expected_return": (
-                        ml.get(
-                            "expected_return"
-                        )
-                    ),
-
-                    "probability_up": (
-                        ml.get(
-                            "probability_up"
-                        )
-                    ),
-
-                    "expected_risk": (
-                        ml.get(
-                            "expected_risk"
-                        )
-                    ),
-
-                    "risk_adjusted_return": (
-                        ml.get(
-                            "risk_adjusted_return"
-                        )
-                    ),
-
-                    "opportunity_score": (
-                        ml.get(
-                            "opportunity_score"
-                        )
-                    ),
-
-                    "confidence": (
-                        ml.get(
-                            "confidence"
-                        )
-                    ),
-
-                    "direction": (
-                        ml.get(
-                            "direction"
-                        )
-                    ),
-
-                    "model_version": (
-                        ml.get(
-                            "model_version"
-                        )
-                    ),
-
-                    "training_rows": (
-                        ml.get(
-                            "training_rows"
-                        )
-                    ),
-
-                    "feature_version": (
-                        ml.get(
-                            "feature_version"
-                        )
-                    ),
-
-                    "model_saved_at": (
-                        ml.get(
-                            "model_saved_at"
-                        )
-                    ),
-
-                    "market_regime": (
-                        market_regime.get(
-                            "regime",
-                            "UNKNOWN",
-                        )
-                    ),
-
-                    "final_score": (
-                        candidate[
-                            "final_score"
-                        ]
-                    ),
-
-                    # OHLC prediction
-                    **ohlc,
-                }
-
-                records.append(
-                    record
-                )
-
-            except Exception as error:
-
-                logger.warning(
-                    "OHLC prediction failed "
-                    "for %s: %s",
-                    symbol,
-                    error,
-                )
-
-
-        if not records:
-
-            logger.warning(
-                "No final predictions created."
-            )
-
-            send_telegram(
-                f"⚠️ No final predictions "
-                f"for `{today}`"
-            )
-
-            return 0
-
-
-        # ====================================================
-        # STEP 9 — SAVE DAILY PREDICTIONS
-        # ====================================================
-
-        prediction_dir = Path(
-            cfg.paths.predictions
-        )
-
-        prediction_dir.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        prediction_file = (
-            prediction_dir
-            / f"{today}.csv"
-        )
-
-        pd.DataFrame(
-            records
-        ).to_csv(
-            prediction_file,
-            index=False,
-        )
-
-        logger.info(
-            "Saved predictions: %s",
-            prediction_file,
-        )
-
-
-        # ====================================================
-        # STEP 10 — PREDICTION LEDGER
-        # ====================================================
-
-        ledger_records: list[
-            dict
-        ] = []
-
-        for record in records:
-
-            symbol = record[
-                "symbol"
-            ]
-
-            valid, validation = (
-                validate_prediction(
-                    symbol,
-                    record,
-                )
-            )
-
-            if not valid:
-
-                logger.warning(
-                    "Prediction validation failed "
-                    "for %s: %s",
-                    symbol,
-                    validation,
-                )
-
-                continue
-
-            current_close = (
-                get_current_close(
-                    symbol
-                )
-            )
-
-            ledger_records.append(
-
-                {
-
-                    "market_date": today,
-
-                    "symbol": symbol,
-
-                    "current_close": (
-                        current_close
-                    ),
-
-                    "predicted_open": float(
-                        record["Open"]
-                    ),
-
-                    "predicted_high": float(
-                        record["High"]
-                    ),
-
-                    "predicted_low": float(
-                        record["Low"]
-                    ),
-
-                    "predicted_close": float(
-                        record["Close"]
-                    ),
-
-                    "expected_return": (
-                        record.get(
-                            "expected_return"
-                        )
-                    ),
-
-                    "probability_up": (
-                        record.get(
-                            "probability_up"
-                        )
-                    ),
-
-                    "expected_risk": (
-                        record.get(
-                            "expected_risk"
-                        )
-                    ),
-
-                    "direction": (
-                        record.get(
-                            "direction"
-                        )
-                    ),
-
-                    "confidence": (
-                        record.get(
-                            "confidence"
-                        )
-                    ),
-
-                    "opportunity_score": (
-                        record.get(
-                            "opportunity_score"
-                        )
-                    ),
-
-                    "final_score": (
-                        record.get(
-                            "final_score"
-                        )
-                    ),
-
-                    "market_regime": (
-                        record.get(
-                            "market_regime"
-                        )
-                    ),
-
-                    "data_quality_score": (
-                        record.get(
-                            "feature_quality"
-                        )
-                    ),
-
-                    "feature_version": (
-                        record.get(
-                            "feature_version"
-                        )
-                    ),
-
-                    "model_version": (
-                        record.get(
-                            "model_version"
-                        )
-                    ),
-
-                    "model_name": "current",
-                }
-            )
-
-
-        # Challenger rows are stored only for later evaluation.
-        if challenger_predictions is not None and not challenger_predictions.empty:
-            for _, challenger in challenger_predictions.iterrows():
-                probability = challenger.get("direction_probability", 0.5)
-                direction_value = challenger.get("predicted_direction")
-                direction = "UP" if direction_value in (1, 1.0, "1") or (direction_value not in (-1, -1.0, "-1") and float(probability) >= 0.50) else "DOWN"
-                ledger_records.append({
-                    "market_date": today, "symbol": challenger.get("symbol"),
-                    "current_close": None, "predicted_open": None,
-                    "predicted_high": None, "predicted_low": None,
-                    "predicted_close": None,
-                    "expected_return": challenger.get("predicted_return"),
-                    "probability_up": probability,
-                    "expected_risk": challenger.get("predicted_risk"),
-                    "direction": direction, "confidence": probability,
-                    "opportunity_score": None, "final_score": None,
-                    "market_regime": market_regime.get("regime", "UNKNOWN"),
-                    "data_quality_score": None,
-                    "feature_version": getattr(cfg.features, "feature_version", "v1"),
-                    "model_version": challenger.get("model_name"),
-                    "model_name": challenger.get("model_name"),
-                })
-
-        if ledger_records:
-
-            record_predictions(
-                ledger_records
-            )
-
-            logger.info(
-                "Ledger records saved: %s",
-                len(ledger_records),
-            )
-
-
-        # ====================================================
-        # STEP 11 — NEWS SENTIMENT
-        # ====================================================
-
-        sentiments: dict = {}
-
+    if hasattr(value, "items"):
         try:
+            return dict(value.items())
+        except Exception:
+            pass
 
-            engine = (
-                get_sentiment_engine()
-            )
+    if hasattr(value, "__dict__"):
+        return {
+            key: item
+            for key, item in vars(value).items()
+            if not key.startswith("_")
+        }
 
-            max_articles = getattr(
-                cfg.sentiment,
-                "max_articles",
-                10,
-            )
+    return {}
 
-            for record in records:
 
-                symbol = record[
-                    "symbol"
-                ]
+def load_config() -> Any:
+    """
+    Load the project configuration.
+    """
 
-                try:
+    try:
+        from src.config import cfg
 
-                    sentiments[symbol] = (
-                        engine.analyze_stock(
-                            symbol,
-                            max_articles,
-                        )
-                    )
-
-                except Exception as error:
-
-                    logger.warning(
-                        "Sentiment failed "
-                        "for %s: %s",
-                        symbol,
-                        error,
-                    )
-
-        except Exception as error:
-
-            logger.warning(
-                "Sentiment engine failed: %s",
-                error,
-            )
-
-
-        # ====================================================
-        # STEP 12 — INDEX PREDICTIONS
-        # ====================================================
-
-        try:
-
-            if (
-                getattr(
-                    cfg,
-                    "indexes",
-                    None,
-                )
-                and getattr(
-                    cfg.indexes,
-                    "enabled",
-                    False,
-                )
-            ):
-
-                predict_indexes()
-
-        except Exception as error:
-
-            logger.warning(
-                "Index prediction failed: %s",
-                error,
-            )
-
-
-        # ====================================================
-        # STEP 13 — TELEGRAM REPORT
-        # ====================================================
-
-        lines = [
-
-            "🚀 *AI STOCK PREDICTIONS*",
-
-            (
-                f"Date: `{today}` | "
-                f"`{_uni_label()}`"
-            ),
-
-            "",
-
-            (
-                "*Market Regime:* "
-                f"`{market_regime.get('regime', 'UNKNOWN')}`"
-            ),
-
-            "",
-
-            "*TOP OPPORTUNITIES*",
-
-            "",
-
-            "```",
-
-            (
-                f"{'Stock':<11} "
-                f"{'Dir':<5} "
-                f"{'PUp':>5} "
-                f"{'Ret%':>7} "
-                f"{'Risk%':>7} "
-                f"{'Score':>6}"
-            ),
-
-            "-" * 52,
-        ]
-
-
-        for record in records:
-
-            symbol = str(
-                record["symbol"]
-            ).replace(
-                ".NS",
-                "",
-            )
-
-            direction = str(
-                record.get(
-                    "direction",
-                    "N",
-                )
-            )
-
-            probability_up = float(
-                record.get(
-                    "probability_up",
-                    0.0,
-                )
-            )
-
-            expected_return = float(
-                record.get(
-                    "expected_return",
-                    0.0,
-                )
-            )
-
-            expected_risk = float(
-                record.get(
-                    "expected_risk",
-                    0.0,
-                )
-            )
-
-            final_score = float(
-                record.get(
-                    "final_score",
-                    0.0,
-                )
-            )
-
-            lines.append(
-
-                f"{symbol:<11} "
-                f"{direction:<5} "
-                f"{probability_up:>5.0%} "
-                f"{expected_return:>+7.2%} "
-                f"{expected_risk:>7.2%} "
-                f"{final_score:>6.2f}"
-            )
-
-
-        lines.append(
-            "```"
-        )
-
-
-        # ====================================================
-        # OHLC SECTION
-        # ====================================================
-
-        lines += [
-
-            "",
-
-            "*OHLC PREDICTIONS*",
-
-            "",
-
-            "```",
-
-            (
-                f"{'Stock':<11} "
-                f"{'Open':>9} "
-                f"{'High':>9} "
-                f"{'Low':>9} "
-                f"{'Close':>9}"
-            ),
-
-            "-" * 52,
-        ]
-
-
-        for record in records:
-
-            symbol = str(
-                record["symbol"]
-            ).replace(
-                ".NS",
-                "",
-            )
-
-            lines.append(
-
-                f"{symbol:<11} "
-                f"{float(record['Open']):>9.2f} "
-                f"{float(record['High']):>9.2f} "
-                f"{float(record['Low']):>9.2f} "
-                f"{float(record['Close']):>9.2f}"
-            )
-
-
-        lines.append(
-            "```"
-        )
-
-
-        # ====================================================
-        # MODEL CONFIDENCE
-        # ====================================================
-
-        lines += [
-
-            "",
-
-            "*MODEL CONFIDENCE*",
-
-        ]
-
-
-        for record in records:
-
-            symbol = str(
-                record["symbol"]
-            ).replace(
-                ".NS",
-                "",
-            )
-
-            confidence = float(
-                record.get(
-                    "confidence",
-                    0.0,
-                )
-            )
-
-            if confidence >= 0.75:
-
-                emoji = "🟢"
-
-            elif confidence >= 0.50:
-
-                emoji = "🟡"
-
-            else:
-
-                emoji = "🔴"
-
-            feature_quality = float(
-                record.get(
-                    "feature_quality",
-                    0.0,
-                )
-            )
-
-            lines.append(
-
-                f"{emoji} {symbol}: "
-                f"`{confidence:.0%}` | "
-                f"Feature: `{feature_quality:.0%}`"
-            )
-
-
-        # ====================================================
-        # SENTIMENT SECTION
-        # ====================================================
-
-        if sentiments:
-
-            lines += [
-
-                "",
-
-                "*NEWS SENTIMENT*",
-
-            ]
-
-            for record in records:
-
-                symbol = record[
-                    "symbol"
-                ]
-
-                sentiment = sentiments.get(
-                    symbol
-                )
-
-                if not sentiment:
-
-                    continue
-
-                try:
-
-                    if not sentiment.article_count:
-
-                        continue
-
-                    score = float(
-                        sentiment.overall_score
-                    )
-
-                    if score >= 0.15:
-
-                        emoji = "🟢"
-
-                    elif score <= -0.15:
-
-                        emoji = "🔴"
-
-                    else:
-
-                        emoji = "⚪"
-
-                    lines.append(
-
-                        f"{emoji} "
-                        f"{str(symbol).replace('.NS', '')}: "
-                        f"`{score:+.2f}` "
-                        f"({sentiment.overall_label})"
-                    )
-
-                except Exception:
-
-                    continue
-
-
-        # ====================================================
-        # IPO WATCHLIST
-        # ====================================================
-
-        try:
-
-            lines += (
-                [""]
-                + ipo_watchlist_telegram_lines()
-            )
-
-        except Exception as error:
-
-            logger.warning(
-                "IPO watchlist failed: %s",
-                error,
-            )
-
-
-        # ====================================================
-        # COMPLETION TIME
-        # ====================================================
-
-        elapsed = int(
-            (
-                datetime.now()
-                - start
-            ).total_seconds()
-        )
-
-        lines += [
-
-            "",
-
-            f"_Completed in {elapsed}s_",
-        ]
-
-
-        # ====================================================
-        # SEND TELEGRAM
-        # ====================================================
-
-        send_telegram(
-            "\n".join(
-                lines
-            )
-        )
-
-
-        logger.info(
-            "=" * 70
-        )
-
-        logger.info(
-            "PHASE 3C MORNING JOB COMPLETED"
-        )
-
-        logger.info(
-            "=" * 70
-        )
-
-        return 0
-
+        return cfg
 
     except Exception as error:
 
         logger.error(
+            "Could not import src.config.cfg: %s",
+            error,
+        )
+
+        raise
+
+
+# ============================================================
+# DATAFRAME HELPERS
+# ============================================================
+
+def ensure_dataframe(
+    value: Any,
+) -> pd.DataFrame:
+    """
+    Convert common prediction outputs into a DataFrame.
+    """
+
+    if value is None:
+        return pd.DataFrame()
+
+    if isinstance(value, pd.DataFrame):
+        return value.copy()
+
+    if isinstance(value, pd.Series):
+        return value.to_frame().T
+
+    if isinstance(value, list):
+        try:
+            return pd.DataFrame(value)
+        except Exception:
+            return pd.DataFrame()
+
+    if isinstance(value, dict):
+        try:
+            return pd.DataFrame([value])
+        except Exception:
+            return pd.DataFrame()
+
+    return pd.DataFrame()
+
+
+def find_column(
+    frame: pd.DataFrame,
+    candidates: list[str],
+) -> str | None:
+    """
+    Find the first matching column.
+    """
+
+    for column in candidates:
+
+        if column in frame.columns:
+            return column
+
+    return None
+
+
+# ============================================================
+# PIPELINE EXECUTION
+# ============================================================
+
+def run_prediction_pipeline() -> pd.DataFrame:
+    """
+    Run the project's prediction pipeline.
+
+    The function tries the available project pipeline entry
+    points in order.
+
+    Supported patterns include:
+
+        src.pipeline.run_pipeline()
+        src.pipeline.run()
+        src.pipeline.main()
+
+        src.prediction_pipeline.run_pipeline()
+        src.prediction_pipeline.run()
+
+        src.predict.run_predictions()
+        src.predict.run()
+    """
+
+    attempts: list[str] = []
+
+    # --------------------------------------------------------
+    # src.pipeline
+    # --------------------------------------------------------
+
+    try:
+
+        from src import pipeline
+
+        for function_name in [
+            "run_pipeline",
+            "run",
+        ]:
+
+            function = getattr(
+                pipeline,
+                function_name,
+                None,
+            )
+
+            if callable(function):
+
+                logger.info(
+                    "Running src.pipeline.%s()",
+                    function_name,
+                )
+
+                result = function()
+
+                return ensure_dataframe(
+                    result
+                )
+
+    except Exception as error:
+
+        attempts.append(
+            f"src.pipeline: {error}"
+        )
+
+    # --------------------------------------------------------
+    # src.prediction_pipeline
+    # --------------------------------------------------------
+
+    try:
+
+        from src import prediction_pipeline
+
+        for function_name in [
+            "run_pipeline",
+            "run",
+        ]:
+
+            function = getattr(
+                prediction_pipeline,
+                function_name,
+                None,
+            )
+
+            if callable(function):
+
+                logger.info(
+                    "Running "
+                    "src.prediction_pipeline.%s()",
+                    function_name,
+                )
+
+                result = function()
+
+                return ensure_dataframe(
+                    result
+                )
+
+    except Exception as error:
+
+        attempts.append(
+            f"src.prediction_pipeline: {error}"
+        )
+
+    # --------------------------------------------------------
+    # src.predict
+    # --------------------------------------------------------
+
+    try:
+
+        from src import predict
+
+        for function_name in [
+            "run_predictions",
+            "run",
+        ]:
+
+            function = getattr(
+                predict,
+                function_name,
+                None,
+            )
+
+            if callable(function):
+
+                logger.info(
+                    "Running src.predict.%s()",
+                    function_name,
+                )
+
+                result = function()
+
+                return ensure_dataframe(
+                    result
+                )
+
+    except Exception as error:
+
+        attempts.append(
+            f"src.predict: {error}"
+        )
+
+    raise RuntimeError(
+        "Could not find a compatible prediction pipeline. "
+        "Attempts: "
+        + " | ".join(attempts)
+    )
+
+
+# ============================================================
+# TOP OPPORTUNITY SELECTION
+# ============================================================
+
+def select_top_opportunities(
+    predictions: pd.DataFrame,
+    limit: int = 5,
+) -> pd.DataFrame:
+    """
+    Select the highest-quality opportunities.
+
+    Ranking preference:
+
+        1. opportunity_score
+        2. quality_score
+        3. confidence
+        4. predicted_return
+    """
+
+    frame = predictions.copy()
+
+    if frame.empty:
+        return frame
+
+    score_column = find_column(
+        frame,
+        [
+            "opportunity_score",
+            "quality_score",
+            "confidence",
+            "predicted_return",
+        ],
+    )
+
+    if score_column is not None:
+
+        frame[score_column] = pd.to_numeric(
+            frame[score_column],
+            errors="coerce",
+        )
+
+        frame = frame.sort_values(
+            by=score_column,
+            ascending=False,
+            na_position="last",
+        )
+
+    return frame.head(
+        max(1, int(limit))
+    ).reset_index(
+        drop=True
+    )
+
+
+# ============================================================
+# LEDGER
+# ============================================================
+
+def get_ledger_path() -> Path:
+    """
+    Get prediction ledger location.
+    """
+
+    cfg = load_config()
+
+    candidates = []
+
+    data_section = getattr(
+        cfg,
+        "data",
+        None,
+    )
+
+    if data_section is not None:
+
+        data_values = object_to_dict(
+            data_section
+        )
+
+        for key in [
+            "prediction_ledger",
+            "ledger",
+        ]:
+
+            if key in data_values:
+                candidates.append(
+                    data_values[key]
+                )
+
+    paths_section = getattr(
+        cfg,
+        "paths",
+        None,
+    )
+
+    if paths_section is not None:
+
+        path_values = object_to_dict(
+            paths_section
+        )
+
+        for key in [
+            "prediction_ledger",
+            "ledger",
+        ]:
+
+            if key in path_values:
+                candidates.append(
+                    path_values[key]
+                )
+
+    for candidate in candidates:
+
+        if candidate:
+
+            path = Path(
+                str(candidate)
+            )
+
+            if not path.is_absolute():
+
+                path = (
+                    PROJECT_ROOT / path
+                )
+
+            return path
+
+    return (
+        PROJECT_ROOT
+        / "data"
+        / "ledger"
+        / "predictions.csv"
+    )
+
+
+def prepare_ledger_records(
+    predictions: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Prepare prediction records for the evaluation ledger.
+    """
+
+    frame = predictions.copy()
+
+    if frame.empty:
+        return frame
+
+    now = utc_now_iso()
+
+    if "prediction_date" not in frame.columns:
+
+        frame["prediction_date"] = now
+
+    if "created_at" not in frame.columns:
+
+        frame["created_at"] = now
+
+    if "evaluation_status" not in frame.columns:
+
+        frame["evaluation_status"] = "PENDING"
+
+    if "actual_return" not in frame.columns:
+
+        frame["actual_return"] = pd.NA
+
+    if "actual_direction" not in frame.columns:
+
+        frame["actual_direction"] = pd.NA
+
+    if "actual_risk" not in frame.columns:
+
+        frame["actual_risk"] = pd.NA
+
+    return frame
+
+
+def append_to_ledger(
+    predictions: pd.DataFrame,
+) -> Path:
+    """
+    Append predictions to the persistent prediction ledger.
+    """
+
+    path = get_ledger_path()
+
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    records = prepare_ledger_records(
+        predictions
+    )
+
+    if records.empty:
+
+        logger.warning(
+            "No prediction records to append "
+            "to the ledger."
+        )
+
+        return path
+
+    file_exists = path.exists()
+
+    try:
+
+        records.to_csv(
+            path,
+            mode="a",
+            header=not file_exists,
+            index=False,
+        )
+
+    except Exception as error:
+
+        logger.error(
+            "Could not update prediction ledger: %s",
+            error,
+        )
+
+        raise
+
+    logger.info(
+        "Added %s prediction(s) to ledger: %s",
+        len(records),
+        path,
+    )
+
+    return path
+
+
+# ============================================================
+# MONITORING
+# ============================================================
+
+def run_production_monitoring() -> dict[str, Any]:
+    """
+    Run production monitoring after prediction generation.
+    """
+
+    try:
+
+        from src.monitoring import (
+            run_monitoring,
+        )
+
+        logger.info(
+            "Running production monitoring."
+        )
+
+        result = run_monitoring()
+
+        if not isinstance(result, dict):
+
+            return {
+                "status": "UNKNOWN",
+                "health_status": "UNKNOWN",
+                "health_score": None,
+                "error": (
+                    "Monitoring returned an "
+                    "unexpected result."
+                ),
+            }
+
+        return result
+
+    except Exception as error:
+
+        logger.exception(
+            "Production monitoring failed."
+        )
+
+        # Fail-safe result.
+        return {
+            "status": "ERROR",
+            "health_status": "CRITICAL",
+            "health_score": 0,
+            "error": str(error),
+            "circuit_breaker": {
+                "state": "ERROR",
+                "predictions_allowed": False,
+                "message": (
+                    "Monitoring failed. "
+                    "Telegram delivery blocked."
+                ),
+            },
+        }
+
+
+# ============================================================
+# CIRCUIT BREAKER
+# ============================================================
+
+def check_circuit_breaker() -> tuple[
+    bool,
+    str,
+    dict[str, Any],
+]:
+    """
+    Check whether predictions may be sent.
+
+    Returns:
+
+        allowed
+        reason
+        breaker_status
+    """
+
+    try:
+
+        from src.circuit_breaker import (
+            can_send_predictions,
+            get_status,
+        )
+
+        allowed, reason = (
+            can_send_predictions()
+        )
+
+        status = get_status()
+
+        logger.info(
+            "Circuit breaker | "
+            "state=%s | "
+            "allowed=%s",
+            status.get("state"),
+            allowed,
+        )
+
+        return (
+            bool(allowed),
+            str(reason),
+            status,
+        )
+
+    except Exception as error:
+
+        logger.exception(
+            "Circuit breaker check failed."
+        )
+
+        # Fail closed.
+        return (
+            False,
+            (
+                "Circuit breaker check failed. "
+                "Telegram delivery blocked for safety. "
+                f"Error: {error}"
+            ),
+            {
+                "state": "ERROR",
+                "predictions_allowed": False,
+                "error": str(error),
+            },
+        )
+
+
+# ============================================================
+# TELEGRAM CONFIGURATION
+# ============================================================
+
+def get_telegram_config() -> dict[str, Any]:
+    """
+    Load Telegram configuration.
+
+    Environment variables override config values:
+
+        TELEGRAM_BOT_TOKEN
+        TELEGRAM_CHAT_ID
+    """
+
+    cfg = load_config()
+
+    telegram_section = getattr(
+        cfg,
+        "telegram",
+        None,
+    )
+
+    values = object_to_dict(
+        telegram_section
+    )
+
+    token = (
+        os.getenv(
+            "TELEGRAM_BOT_TOKEN"
+        )
+        or values.get("bot_token")
+        or values.get("token")
+    )
+
+    chat_id = (
+        os.getenv(
+            "TELEGRAM_CHAT_ID"
+        )
+        or values.get("chat_id")
+    )
+
+    enabled = values.get(
+        "enabled",
+        True,
+    )
+
+    return {
+        "enabled": bool(enabled),
+        "bot_token": token,
+        "chat_id": chat_id,
+    }
+
+
+# ============================================================
+# TELEGRAM MESSAGE
+# ============================================================
+
+def format_number(
+    value: Any,
+    decimals: int = 2,
+    suffix: str = "",
+) -> str:
+    """
+    Format a numeric value safely.
+    """
+
+    try:
+
+        numeric = float(value)
+
+        if pd.isna(numeric):
+            return "N/A"
+
+        return (
+            f"{numeric:.{decimals}f}"
+            f"{suffix}"
+        )
+
+    except Exception:
+
+        return "N/A"
+
+
+def format_prediction_message(
+    predictions: pd.DataFrame,
+    monitoring: dict[str, Any] | None = None,
+) -> str:
+    """
+    Build the Telegram Top 5 prediction message.
+    """
+
+    if predictions.empty:
+
+        return (
+            "📊 Market Prediction Update\n\n"
+            "No qualified opportunities were found."
+        )
+
+    lines = [
+        "📈 TOP MARKET OPPORTUNITIES",
+        "",
+        (
+            f"Generated: "
+            f"{datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        ),
+        "",
+    ]
+
+    symbol_column = find_column(
+        predictions,
+        [
+            "symbol",
+            "ticker",
+            "stock",
+        ],
+    )
+
+    return_column = find_column(
+        predictions,
+        [
+            "predicted_return",
+            "expected_return",
+            "return_prediction",
+        ],
+    )
+
+    direction_column = find_column(
+        predictions,
+        [
+            "predicted_direction",
+            "direction",
+            "direction_prediction",
+        ],
+    )
+
+    confidence_column = find_column(
+        predictions,
+        [
+            "confidence",
+            "confidence_score",
+        ],
+    )
+
+    risk_column = find_column(
+        predictions,
+        [
+            "predicted_risk",
+            "risk_score",
+            "risk",
+        ],
+    )
+
+    opportunity_column = find_column(
+        predictions,
+        [
+            "opportunity_score",
+            "quality_score",
+        ],
+    )
+
+    for index, row in predictions.iterrows():
+
+        rank = index + 1
+
+        symbol = (
+            str(
+                row.get(
+                    symbol_column,
+                    "UNKNOWN",
+                )
+            )
+            if symbol_column
+            else "UNKNOWN"
+        )
+
+        lines.append(
+            f"{rank}. {symbol}"
+        )
+
+        if return_column:
+
+            value = format_number(
+                row.get(
+                    return_column
+                ),
+                decimals=2,
+                suffix="%",
+            )
+
+            lines.append(
+                f"   Expected Return: {value}"
+            )
+
+        if direction_column:
+
+            direction = row.get(
+                direction_column
+            )
+
+            if pd.notna(direction):
+
+                lines.append(
+                    f"   Direction: {direction}"
+                )
+
+        if confidence_column:
+
+            confidence = format_number(
+                row.get(
+                    confidence_column
+                ),
+                decimals=2,
+            )
+
+            lines.append(
+                f"   Confidence: {confidence}"
+            )
+
+        if risk_column:
+
+            risk = format_number(
+                row.get(
+                    risk_column
+                ),
+                decimals=2,
+            )
+
+            lines.append(
+                f"   Risk: {risk}"
+            )
+
+        if opportunity_column:
+
+            score = format_number(
+                row.get(
+                    opportunity_column
+                ),
+                decimals=2,
+            )
+
+            lines.append(
+                f"   Opportunity Score: {score}"
+            )
+
+        lines.append("")
+
+    if monitoring:
+
+        health_status = monitoring.get(
+            "health_status"
+        )
+
+        health_score = monitoring.get(
+            "health_score"
+        )
+
+        if health_status is not None:
+
+            lines.extend(
+                [
+                    "──────────────────",
+                    (
+                        "System Health: "
+                        f"{health_status}"
+                    ),
+                    (
+                        "Health Score: "
+                        f"{health_score}"
+                    ),
+                ]
+            )
+
+    return "\n".join(
+        lines
+    )
+
+
+# ============================================================
+# TELEGRAM DELIVERY
+# ============================================================
+
+def send_telegram_message(
+    message: str,
+) -> bool:
+    """
+    Send a message through Telegram.
+
+    Uses the project's telegram module when available.
+    Falls back to the Telegram Bot API through requests.
+    """
+
+    telegram_config = (
+        get_telegram_config()
+    )
+
+    if not telegram_config.get(
+        "enabled",
+        True,
+    ):
+
+        logger.warning(
+            "Telegram is disabled."
+        )
+
+        return False
+
+    token = telegram_config.get(
+        "bot_token"
+    )
+
+    chat_id = telegram_config.get(
+        "chat_id"
+    )
+
+    if not token or not chat_id:
+
+        raise RuntimeError(
+            "Telegram configuration is incomplete. "
+            "TELEGRAM_BOT_TOKEN and "
+            "TELEGRAM_CHAT_ID are required."
+        )
+
+    # --------------------------------------------------------
+    # Try project Telegram module first.
+    # --------------------------------------------------------
+
+    try:
+
+        from src.telegram import (
+            send_message,
+        )
+
+        result = send_message(
+            message
+        )
+
+        if result is None:
+
+            return True
+
+        return bool(result)
+
+    except ImportError:
+
+        pass
+
+    except Exception as error:
+
+        logger.warning(
+            "Project Telegram module failed. "
+            "Using direct API fallback: %s",
+            error,
+        )
+
+    # --------------------------------------------------------
+    # Telegram Bot API fallback.
+    # --------------------------------------------------------
+
+    try:
+
+        import requests
+
+    except ImportError as error:
+
+        raise RuntimeError(
+            "requests package is required for "
+            "Telegram delivery."
+        ) from error
+
+    endpoint = (
+        f"https://api.telegram.org/bot"
+        f"{token}/sendMessage"
+    )
+
+    response = requests.post(
+        endpoint,
+        json={
+            "chat_id": chat_id,
+            "text": message,
+        },
+        timeout=30,
+    )
+
+    response.raise_for_status()
+
+    logger.info(
+        "Telegram message sent successfully."
+    )
+
+    return True
+
+
+# ============================================================
+# MAIN JOB
+# ============================================================
+
+def run_morning_job() -> dict[str, Any]:
+    """
+    Run the complete morning prediction job.
+    """
+
+    result: dict[str, Any] = {
+        "started_at": utc_now_iso(),
+        "status": "STARTED",
+        "predictions_generated": 0,
+        "top_predictions": 0,
+        "ledger_updated": False,
+        "telegram_sent": False,
+        "telegram_blocked": False,
+        "circuit_breaker": {},
+        "monitoring": {},
+        "error": None,
+    }
+
+    logger.info(
+        "=" * 70
+    )
+
+    logger.info(
+        "STARTING MORNING PREDICTION JOB"
+    )
+
+    logger.info(
+        "=" * 70
+    )
+
+    try:
+
+        # ----------------------------------------------------
+        # STEP 1: GENERATE PREDICTIONS
+        # ----------------------------------------------------
+
+        logger.info(
+            "Step 1: Generating predictions."
+        )
+
+        predictions = (
+            run_prediction_pipeline()
+        )
+
+        result[
+            "predictions_generated"
+        ] = len(
+            predictions
+        )
+
+        logger.info(
+            "Generated %s prediction(s).",
+            len(predictions),
+        )
+
+        if predictions.empty:
+
+            result["status"] = "NO_PREDICTIONS"
+
+            logger.warning(
+                "No predictions were generated."
+            )
+
+            return result
+
+        # ----------------------------------------------------
+        # STEP 2: SELECT TOP 5
+        # ----------------------------------------------------
+
+        logger.info(
+            "Step 2: Selecting top opportunities."
+        )
+
+        top_predictions = (
+            select_top_opportunities(
+                predictions,
+                limit=5,
+            )
+        )
+
+        result[
+            "top_predictions"
+        ] = len(
+            top_predictions
+        )
+
+        # ----------------------------------------------------
+        # STEP 3: UPDATE LEDGER
+        # ----------------------------------------------------
+
+        logger.info(
+            "Step 3: Updating prediction ledger."
+        )
+
+        ledger_path = append_to_ledger(
+            top_predictions
+        )
+
+        result["ledger_updated"] = True
+
+        result["ledger_path"] = str(
+            ledger_path
+        )
+
+        # ----------------------------------------------------
+        # STEP 4: RUN MONITORING
+        # ----------------------------------------------------
+
+        logger.info(
+            "Step 4: Running production monitoring."
+        )
+
+        monitoring = (
+            run_production_monitoring()
+        )
+
+        result[
+            "monitoring"
+        ] = monitoring
+
+        # ----------------------------------------------------
+        # STEP 5: CHECK CIRCUIT BREAKER
+        # ----------------------------------------------------
+
+        logger.info(
+            "Step 5: Checking circuit breaker."
+        )
+
+        allowed, reason, breaker_status = (
+            check_circuit_breaker()
+        )
+
+        result[
+            "circuit_breaker"
+        ] = breaker_status
+
+        # ----------------------------------------------------
+        # STEP 6: BLOCK OR SEND TELEGRAM
+        # ----------------------------------------------------
+
+        if not allowed:
+
+            result[
+                "telegram_blocked"
+            ] = True
+
+            result["status"] = (
+                "TELEGRAM_BLOCKED"
+            )
+
+            result[
+                "telegram_block_reason"
+            ] = reason
+
+            logger.warning(
+                "Telegram delivery BLOCKED: %s",
+                reason,
+            )
+
+            logger.warning(
+                "Predictions were generated and "
+                "ledger was updated, but no market "
+                "signals were sent because the "
+                "circuit breaker is not CLOSED."
+            )
+
+            return result
+
+        logger.info(
+            "Step 6: Sending Telegram message."
+        )
+
+        message = (
+            format_prediction_message(
+                top_predictions,
+                monitoring,
+            )
+        )
+
+        telegram_sent = (
+            send_telegram_message(
+                message
+            )
+        )
+
+        result[
+            "telegram_sent"
+        ] = telegram_sent
+
+        if telegram_sent:
+
+            result["status"] = "SUCCESS"
+
+        else:
+
+            result["status"] = (
+                "TELEGRAM_NOT_SENT"
+            )
+
+        return result
+
+    except Exception as error:
+
+        logger.exception(
+            "Morning prediction job failed."
+        )
+
+        result["status"] = "FAILED"
+
+        result["error"] = str(
+            error
+        )
+
+        result["traceback"] = (
             traceback.format_exc()
         )
 
+        # Register critical pipeline failure.
         try:
 
-            send_telegram(
-
-                "❌ *Phase 3C Morning Job Failed*\n"
-
-                f"Date: `{today}`\n"
-
-                f"```{str(error)[:700]}```"
+            from src.circuit_breaker import (
+                register_failure,
             )
 
-        except Exception:
+            register_failure(
+                reason=(
+                    "Morning job failed: "
+                    f"{error}"
+                ),
+                health_score=0,
+                health_status="CRITICAL",
+            )
 
-            pass
+        except Exception as breaker_error:
 
-        return 1
+            logger.error(
+                "Could not register failure "
+                "with circuit breaker: %s",
+                breaker_error,
+            )
+
+        return result
+
+    finally:
+
+        result["finished_at"] = (
+            utc_now_iso()
+        )
+
+        logger.info(
+            "=" * 70
+        )
+
+        logger.info(
+            "MORNING JOB FINISHED | STATUS=%s",
+            result.get("status"),
+        )
+
+        logger.info(
+            "=" * 70
+        )
+
+
+# ============================================================
+# CLI
+# ============================================================
+
+def main() -> int:
+    """
+    CLI entry point.
+    """
+
+    result = run_morning_job()
+
+    print()
+
+    print("=" * 70)
+
+    print("MORNING JOB RESULT")
+
+    print("=" * 70)
+
+    print(
+        "Status: "
+        f"{result.get('status')}"
+    )
+
+    print(
+        "Predictions generated: "
+        f"{result.get('predictions_generated')}"
+    )
+
+    print(
+        "Top predictions: "
+        f"{result.get('top_predictions')}"
+    )
+
+    print(
+        "Ledger updated: "
+        f"{result.get('ledger_updated')}"
+    )
+
+    print(
+        "Telegram sent: "
+        f"{result.get('telegram_sent')}"
+    )
+
+    print(
+        "Telegram blocked: "
+        f"{result.get('telegram_blocked')}"
+    )
+
+    breaker = result.get(
+        "circuit_breaker",
+        {},
+    )
+
+    if breaker:
+
+        print()
+
+        print("Circuit Breaker:")
+
+        print(
+            "  State: "
+            f"{breaker.get('state')}"
+        )
+
+        print(
+            "  Predictions allowed: "
+            f"{breaker.get('predictions_allowed')}"
+        )
+
+        print(
+            "  Reason: "
+            f"{breaker.get('reason', breaker.get('message'))}"
+        )
+
+    monitoring = result.get(
+        "monitoring",
+        {},
+    )
+
+    if monitoring:
+
+        print()
+
+        print("System Health:")
+
+        print(
+            "  Status: "
+            f"{monitoring.get('health_status')}"
+        )
+
+        print(
+            "  Score: "
+            f"{monitoring.get('health_score')}"
+        )
+
+    if result.get("error"):
+
+        print()
+
+        print(
+            "Error: "
+            f"{result.get('error')}"
+        )
+
+    return (
+        0
+        if result.get("status")
+        in {
+            "SUCCESS",
+            "TELEGRAM_BLOCKED",
+            "NO_PREDICTIONS",
+        }
+        else 1
+    )
 
 
 if __name__ == "__main__":
