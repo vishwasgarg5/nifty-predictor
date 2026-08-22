@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.pyo
+
+.venv/
+venv/
+env/
+
+.env
+
+.DS_Store
+
+data/predictions/prediction_ledger.csv
+data/evaluation/model_metrics.csv
