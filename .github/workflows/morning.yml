@@ -6,6 +6,20 @@ on:
     - cron: '15 3 * * 1-5'
   workflow_dispatch:          # Manual trigger for testing
 
+- name: Light meta refresh
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/refresh_meta.py
+        continue-on-error: true
+
+      - name: Run Morning Job
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python scripts/morning_job.py
+
 jobs:
   morning-job:
     runs-on: ubuntu-latest
