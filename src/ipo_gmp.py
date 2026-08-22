@@ -384,19 +384,34 @@ def build_ipo_desk_message(max_rows: int = 10) -> str:
     if df.empty:
         return "*IPO DESK*\nNo IPO data yet."
 
-    if "Status" in df.columns:
+    df = df.copy()
+    for c in ("GMP", "PriceHigh", "PriceLow", "SubTotal", "SubQIB", "SubNII", "SubRetail"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
+    # Keep rows that have some signal
+    mask = (df["GMP"].abs() > 0) | (df["PriceHigh"] > 0) | (df.get("SubTotal", 0) > 0)
+    useful = df.loc[mask].copy()
+    if useful.empty:
+        # show a short notice instead of 40 empty names
+        return (
+            "*IPO DESK*\n"
+            f"As of `{datetime.now():%Y-%m-%d %H:%M}`\n"
+            "No usable GMP/price rows in pipeline.\n"
+            "_Scrape got names only — update source or seed._"
+        )
+
+    if "Status" in useful.columns:
         order = {"open": 0, "upcoming": 1, "closed": 2}
-        try:
-            df = df.copy()
-            df["_ord"] = df["Status"].astype(str).str.lower().map(lambda x: order.get(x, 9))
-            df = df.sort_values(["_ord", "Name"])
-        except Exception:
-            pass
+        useful["_ord"] = useful["Status"].astype(str).str.lower().map(lambda x: order.get(x, 9))
+        useful = useful.sort_values(["_ord", "GMP"], ascending=[True, False])
+    else:
+        useful = useful.sort_values("GMP", ascending=False)
 
     lines = [
         "*IPO DESK – GMP + Subscription*",
         f"As of `{datetime.now():%Y-%m-%d %H:%M}`",
-        "_GMP unofficial · Sub in times (x) · not advice_",
+        "_GMP unofficial · Sub in x · not advice_",
         "",
         "```",
         f"{'IPO':<18} {'GMP':>5} {'%':>5} {'Sub':>6} {'Verdict':>8}",
@@ -404,24 +419,15 @@ def build_ipo_desk_message(max_rows: int = 10) -> str:
     ]
 
     shown = 0
-    for _, r in df.iterrows():
+    for _, r in useful.iterrows():
         if shown >= max_rows:
             break
         name = str(r.get("Name", ""))[:18]
-        try:
-            high = float(r.get("PriceHigh") or 0)
-        except Exception:
-            high = 0.0
-        try:
-            gmp = float(r.get("GMP") or 0)
-        except Exception:
-            gmp = 0.0
-        try:
-            sub = float(r.get("SubTotal") or 0)
-        except Exception:
-            sub = 0.0
-        pct = (gmp / high * 100) if high else 0.0
-        sub_s = f"{sub:.1f}x" if sub else "-"
+        high = float(r.get("PriceHigh") or 0)
+        gmp = float(r.get("GMP") or 0)
+        sub = float(r.get("SubTotal") or 0)
+        pct = (gmp / high * 100) if high > 0 else 0.0
+        sub_s = f"{sub:.1f}x" if sub > 0 else "-"
         lines.append(
             f"{name:<18} {gmp:>5.0f} {pct:>4.0f}% {sub_s:>6} {_verdict(pct):>8}"
         )
@@ -429,23 +435,20 @@ def build_ipo_desk_message(max_rows: int = 10) -> str:
 
     lines.append("```")
 
-    # detail lines for open IPOs with category sub
     detail = []
-    for _, r in df.iterrows():
+    for _, r in useful.iterrows():
         if str(r.get("Status", "")).lower() != "open":
             continue
-        qib = _to_float(r.get("SubQIB"), 0)
-        nii = _to_float(r.get("SubNII"), 0)
-        rii = _to_float(r.get("SubRetail"), 0)
+        qib = float(r.get("SubQIB") or 0)
+        nii = float(r.get("SubNII") or 0)
+        rii = float(r.get("SubRetail") or 0)
         if qib or nii or rii:
             detail.append(
-                f"• `{str(r.get('Name',''))[:20]}` QIB `{qib:.1f}x` NII `{nii:.1f}x` RII `{rii:.1f}x`"
+                f"• `{str(r.get('Name', ''))[:20]}` "
+                f"QIB `{qib:.1f}x` NII `{nii:.1f}x` RII `{rii:.1f}x`"
             )
     if detail:
-        lines.append("")
-        lines.append("*Subscription (open)*")
-        lines.extend(detail[:6])
+        lines += ["", "*Subscription (open)*"] + detail[:6]
 
-    lines.append("")
-    lines.append("• Positive GMP%≥20 · check RHP before applying")
+    lines += ["", "• Positive: GMP% ≥ 20 · check RHP before applying"]
     return "\n".join(lines)
