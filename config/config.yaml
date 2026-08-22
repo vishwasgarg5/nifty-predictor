@@ -1,234 +1,36 @@
 # ============================================================
-# MARKET PREDICTION SYSTEM CONFIGURATION
-# ============================================================
-
-project:
-  name: market-prediction-system
-  environment: production
-  timezone: Asia/Kolkata
-
-
-# ============================================================
-# DATA
-# ============================================================
-
-data:
-
-  market_source: yahoo
-
-  symbols:
-    - RELIANCE
-    - TCS
-    - INFY
-    - HDFCBANK
-    - ICICIBANK
-    - SBIN
-    - LT
-    - ITC
-    - HINDUNILVR
-    - BHARTIARTL
-
-  prediction_ledger: data/ledger/predictions.csv
-
-
-# ============================================================
-# MARKET REGIME
-# ============================================================
-
-market_regime:
-
-  enabled: true
-
-  index_symbol: "^NSEI"
-
-  lookback_days: 60
-
-  regimes:
-    - BULL
-    - BEAR
-    - SIDEWAYS
-    - HIGH_VOLATILITY
-
-
-# ============================================================
-# FEATURES
-# ============================================================
-
-features:
-
-  lookback_days: 60
-
-  return_periods:
-    - 1
-    - 5
-    - 10
-    - 20
-
-  volatility_window: 20
-
-  moving_averages:
-    - 5
-    - 10
-    - 20
-    - 50
-
-  rsi_period: 14
-
-
-# ============================================================
-# MODELS
-# ============================================================
-
-models:
-
-  return_model:
-    enabled: true
-
-  direction_model:
-    enabled: true
-
-  risk_model:
-    enabled: true
-
-
-# ============================================================
-# ENSEMBLE
-# ============================================================
-
-ensemble:
-
-  enabled: true
-
-  return_weight: 0.40
-  direction_weight: 0.35
-  risk_weight: 0.25
-
-
-# ============================================================
-# OPPORTUNITY SCORING
-# ============================================================
-
-opportunity:
-
-  minimum_confidence: 0.50
-
-  weights:
-
-    predicted_return: 0.40
-    confidence: 0.35
-    risk: 0.25
-
-
-# ============================================================
-# QUALITY GATE
-# ============================================================
-
-quality_gate:
-
-  enabled: true
-
-  minimum_opportunity_score: 0.50
-
-  minimum_confidence: 0.50
-
-  maximum_risk: 10.0
-
-
-# ============================================================
-# SECTOR DIVERSIFICATION
-# ============================================================
-
-sector_diversification:
-
-  enabled: true
-
-  max_per_sector: 2
-
-
-# ============================================================
-# OUTPUT
-# ============================================================
-
-output:
-
-  top_n: 5
-
-
-# ============================================================
-# EVALUATION
-# ============================================================
-
-evaluation:
-
-  enabled: true
-
-  horizon_days: 1
-
-  price_source: yahoo
-
-
-# ============================================================
-# MONITORING
-# ============================================================
-
-monitoring:
-
-  enabled: true
-
-  minimum_health_score: 50
-
-  critical_health_score: 25
-
-  minimum_direction_accuracy: 0.45
-
-  maximum_mae: 5.0
-
-  maximum_rmse: 7.5
-
-
-# ============================================================
-# DRIFT DETECTION
-# ============================================================
-
-drift_detection:
-
-  enabled: true
-
-  window_size: 30
-
-  minimum_samples: 20
-
-  warning_threshold: 0.10
-
-  critical_threshold: 0.20
-
-
-# ============================================================
-# CIRCUIT BREAKER
-# ============================================================
-
-circuit_breaker:
-
-  enabled: true
-
-  state_file: data/monitoring/circuit_breaker.json
-
-  failure_threshold: 3
-
-  critical_health_score: 25
-
-  auto_reset: false
-
-
-# ============================================================
-# MODEL REGISTRY
+# PRODUCTION MODEL REGISTRY
 # ============================================================
 
 model_registry:
 
   enabled: true
 
-  registry_file: data/models/model_registry.json
+  # Persistent registry containing the active production Champion.
+  path: data/models/model_registry.json
+
+  # Keep a history of model promotion and rollback events.
+  keep_history: true
+
+
+# ============================================================
+# PRODUCTION MODEL LOADING
+# ============================================================
+
+models:
+
+  # Dynamic production model registry.
+  registry_path: data/models/model_registry.json
+
+  # During initial deployment, allow the existing per-symbol
+  # ModelStore models when no production Champion is registered.
+  require_champion: false
+
+  # Existing model loading remains available as a fallback.
+  allow_fallback_model: true
+
+  # Cache loaded production models within a running process.
+  cache_enabled: true
 
 
 # ============================================================
@@ -239,32 +41,25 @@ champion_challenger:
 
   enabled: true
 
-  # Challenger must improve direction accuracy
-  # by at least 1%.
-  minimum_accuracy_improvement: 0.01
+  # Legacy/current logical model names.
+  champion: current
+  challenger: challenger_v1
 
-  # Challenger must improve MAE / RMSE type
-  # error metrics by at least 1%.
-  minimum_error_improvement: 0.01
+  minimum_evaluations: 30
+  comparison_window: 50
 
-  # Challenger must win this many consecutive
-  # comparison cycles before promotion.
-  required_wins: 2
+  # Challenger must outperform the Champion by at least 2%.
+  minimum_improvement: 0.02
 
-  # Stores historical comparison decisions.
-  history_file: data/models/champion_challenger_history.json
+  evaluate_return_mae: true
+  evaluate_direction_accuracy: true
+  evaluate_brier_score: true
+  evaluate_risk_mae: true
 
+  # Promotion remains controlled until the production loader
+  # has been fully validated.
+  auto_promote: false
+  require_manual_approval: true
 
-# ============================================================
-# TELEGRAM
-# ============================================================
-
-telegram:
-
-  enabled: true
-
-  # Use GitHub Secrets / environment variables
-  # for actual credentials.
-  bot_token: null
-
-  chat_id: null
+  # After promotion, the registry becomes the source of truth.
+  use_model_registry: true
