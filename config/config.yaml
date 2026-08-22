@@ -1,10 +1,11 @@
 # ============================================================
-# STOCK PREDICTION SYSTEM CONFIGURATION
+# MARKET PREDICTION SYSTEM CONFIGURATION
 # ============================================================
 
 project:
-  name: nse-stock-prediction-system
-  version: "1.0"
+  name: "NSE Market Prediction System"
+  version: "1.0.0"
+  environment: "production"
   timezone: "Asia/Kolkata"
 
 
@@ -14,10 +15,10 @@ project:
 
 data_sources:
 
-  yahoo:
+  nse:
     enabled: true
 
-  nse:
+  yahoo:
     enabled: true
 
   news:
@@ -25,120 +26,121 @@ data_sources:
 
 
 # ============================================================
-# STOCK UNIVERSES
+# DATA SETTINGS
 # ============================================================
 
-universes:
+data:
 
-  primary:
-    - nifty100
-    - nifty500
+  raw_dir: "data/raw"
 
-  secondary:
-    - midcap150
+  processed_dir: "data/processed"
 
-  ipo:
-    enabled: true
-    max_age_days: 730
-    min_trading_days: 30
+  models_dir: "data/models"
 
+  reports_dir: "data/reports"
 
-indexes:
+  prediction_ledger: "data/ledger/predictions.csv"
 
-  - "^NSEI"
-  - "^NSEBANK"
+  market_data_dir: "data/market"
+
+  news_data_dir: "data/news"
 
 
 # ============================================================
-# IPO DESK
+# PATHS
 # ============================================================
 
-ipo_desk:
+paths:
+
+  data: "data"
+
+  raw: "data/raw"
+
+  processed: "data/processed"
+
+  models: "data/models"
+
+  reports: "data/reports"
+
+  ledger: "data/ledger/predictions.csv"
+
+  prediction_ledger: "data/ledger/predictions.csv"
+
+  logs: "logs"
+
+
+# ============================================================
+# MARKET SETTINGS
+# ============================================================
+
+market:
+
+  exchange: "NSE"
+
+  country: "India"
+
+  index: "^NSEI"
+
+  benchmark: "^NSEI"
+
+  currency: "INR"
+
+  trading_days:
+    - "Monday"
+    - "Tuesday"
+    - "Wednesday"
+    - "Thursday"
+    - "Friday"
+
+  market_open: "09:15"
+
+  market_close: "15:30"
+
+
+# ============================================================
+# UNIVERSE
+# ============================================================
+
+universe:
 
   enabled: true
 
-  max_age_days: 730
+  symbols:
+    - "RELIANCE"
+    - "TCS"
+    - "INFY"
+    - "HDFCBANK"
+    - "ICICIBANK"
+    - "SBIN"
+    - "ITC"
+    - "LT"
+    - "BHARTIARTL"
+    - "AXISBANK"
 
-  min_history_days: 30
-
-  include_recent_ipos: true
-
-
-# ============================================================
-# PIPELINE LIMITS
-# ============================================================
-
-top_n: 5
-
-lookback_days: 365
-
-min_history_days: 120
-
-liquidity:
-
-  enabled: true
-
-  minimum_price: 20
-
-  minimum_average_volume: 100000
-
-
-universe_filter:
-
-  enabled: true
-
-  max_symbols: 1000
+  max_symbols: 200
 
 
 # ============================================================
-# FEATURE ENGINE
+# DATA VALIDATION
 # ============================================================
 
-features:
+validation:
 
   enabled: true
 
-  technical: true
+  fail_on_missing_data: false
 
-  fundamental: true
+  minimum_rows: 50
 
-  news: true
+  maximum_missing_percentage: 20
 
-  point_in_time: true
+  check_duplicate_dates: true
 
+  check_negative_prices: true
 
-technical:
+  check_zero_prices: true
 
-  sma_periods:
-    - 5
-    - 10
-    - 20
-    - 50
-    - 100
-    - 200
-
-  ema_periods:
-    - 10
-    - 20
-    - 50
-
-  rsi_period: 14
-
-  volatility_period: 20
-
-  momentum_periods:
-    - 5
-    - 10
-    - 20
-
-  volume_period: 20
-
-
-point_in_time:
-
-  enabled: true
-
-  strict: true
+  require_volume: false
 
 
 # ============================================================
@@ -149,60 +151,241 @@ market_regime:
 
   enabled: true
 
-  index: "^NSEI"
+  benchmark_symbol: "^NSEI"
 
-  lookback_days: 100
+  short_window: 20
+
+  long_window: 50
 
   volatility_window: 20
 
-  trend_fast: 20
+  regimes:
 
-  trend_slow: 50
+    bull:
+      enabled: true
 
+    bear:
+      enabled: true
 
-# ============================================================
-# SCORING
-# ============================================================
+    sideways:
+      enabled: true
 
-scoring:
-
-  stage1_limit: 250
-
-  prefilter_top: 40
-
-  weights:
-
-    technical: 0.70
-
-    fundamental: 0.30
+    high_volatility:
+      enabled: true
 
 
 # ============================================================
-# MACHINE LEARNING
+# TECHNICAL FEATURES
 # ============================================================
 
-models:
+technical:
 
   enabled: true
 
-  active_model: "ohlc-v1"
+  indicators:
 
-  return_model: true
+    sma:
+      - 5
+      - 10
+      - 20
+      - 50
+      - 200
 
-  direction_model: true
+    ema:
+      - 5
+      - 10
+      - 20
+      - 50
 
-  risk_model: true
+    rsi:
+      period: 14
 
-  ensemble: true
+    macd:
+      fast: 12
+      slow: 26
+      signal: 9
+
+    bollinger_bands:
+      period: 20
+      std: 2
+
+    atr:
+      period: 14
+
+    volatility:
+      period: 20
+
+    momentum:
+      periods:
+        - 5
+        - 10
+        - 20
+
+    returns:
+      periods:
+        - 1
+        - 5
+        - 10
+        - 20
 
 
-model:
+# ============================================================
+# FUNDAMENTAL FEATURES
+# ============================================================
 
-  name: "ohlc-v1"
+fundamental:
 
-  version: "1.0"
+  enabled: true
 
-  retrain_enabled: true
+  features:
+    - "market_cap"
+    - "pe_ratio"
+    - "pb_ratio"
+    - "debt_to_equity"
+    - "return_on_equity"
+    - "profit_margin"
+
+
+# ============================================================
+# NEWS FEATURES
+# ============================================================
+
+news:
+
+  enabled: true
+
+  sentiment_enabled: true
+
+  lookback_hours: 24
+
+  max_articles_per_symbol: 20
+
+  sentiment_weight: 1.0
+
+
+# ============================================================
+# FEATURE ENGINEERING
+# ============================================================
+
+features:
+
+  enabled: true
+
+  target_horizon_days: 1
+
+  normalize: true
+
+  handle_missing_values: true
+
+  fill_method: "ffill"
+
+  clip_outliers: true
+
+  outlier_std_threshold: 5
+
+  minimum_feature_count: 5
+
+
+# ============================================================
+# RETURN MODEL
+# ============================================================
+
+return_model:
+
+  enabled: true
+
+  model_type: "random_forest"
+
+  prediction_column: "predicted_return"
+
+  target_column: "future_return"
+
+  horizon_days: 1
+
+  random_state: 42
+
+  n_estimators: 300
+
+  max_depth: 10
+
+  min_samples_split: 5
+
+  min_samples_leaf: 2
+
+
+# ============================================================
+# DIRECTION MODEL
+# ============================================================
+
+direction_model:
+
+  enabled: true
+
+  model_type: "random_forest_classifier"
+
+  prediction_column: "predicted_direction"
+
+  probability_column: "confidence"
+
+  target_column: "future_direction"
+
+  horizon_days: 1
+
+  random_state: 42
+
+  n_estimators: 300
+
+  max_depth: 10
+
+  min_samples_split: 5
+
+  min_samples_leaf: 2
+
+
+# ============================================================
+# RISK MODEL
+# ============================================================
+
+risk_model:
+
+  enabled: true
+
+  model_type: "random_forest"
+
+  prediction_column: "predicted_risk"
+
+  target_column: "future_volatility"
+
+  horizon_days: 1
+
+  random_state: 42
+
+  n_estimators: 300
+
+  max_depth: 10
+
+  min_samples_split: 5
+
+  min_samples_leaf: 2
+
+
+# ============================================================
+# ENSEMBLE MODEL
+# ============================================================
+
+ensemble:
+
+  enabled: true
+
+  return_weight: 0.40
+
+  direction_weight: 0.35
+
+  risk_weight: 0.25
+
+  normalize_weights: true
+
+  minimum_models_required: 2
 
 
 # ============================================================
@@ -213,7 +396,11 @@ confidence:
 
   enabled: true
 
-  minimum_score: 0.50
+  minimum_confidence: 0.55
+
+  strong_confidence: 0.70
+
+  high_confidence: 0.80
 
 
 # ============================================================
@@ -223,6 +410,12 @@ confidence:
 opportunity:
 
   enabled: true
+
+  return_weight: 0.40
+
+  confidence_weight: 0.35
+
+  risk_weight: 0.25
 
   minimum_score: 0.50
 
@@ -235,9 +428,15 @@ quality_gate:
 
   enabled: true
 
-  minimum_confidence: 0.50
+  minimum_confidence: 0.55
 
   minimum_opportunity_score: 0.50
+
+  maximum_risk: 0.80
+
+  require_positive_return: true
+
+  require_valid_market_data: true
 
 
 # ============================================================
@@ -250,6 +449,25 @@ sector_diversification:
 
   max_per_sector: 2
 
+  max_total_positions: 5
+
+  minimum_sectors: 2
+
+
+# ============================================================
+# TOP PICKS
+# ============================================================
+
+top_picks:
+
+  enabled: true
+
+  count: 5
+
+  ranking_column: "opportunity_score"
+
+  ascending: false
+
 
 # ============================================================
 # PREDICTION LEDGER
@@ -259,9 +477,15 @@ ledger:
 
   enabled: true
 
-  auto_create: true
+  path: "data/ledger/predictions.csv"
 
-  evaluate_after_market_close: true
+  format: "csv"
+
+  store_all_predictions: false
+
+  store_top_predictions_only: true
+
+  generate_prediction_id: true
 
 
 # ============================================================
@@ -272,9 +496,121 @@ evaluation:
 
   enabled: true
 
-  recent_window: 50
+  horizon_days: 1
 
-  save_reports: true
+  price_source: "yahoo"
+
+  benchmark_symbol: "^NSEI"
+
+  evaluate_after_market_close: true
+
+  entry_price_column: "entry_price"
+
+  exit_price_column: "exit_price"
+
+  predicted_return_column: "predicted_return"
+
+  actual_return_column: "actual_return"
+
+  predicted_direction_column: "predicted_direction"
+
+  actual_direction_column: "actual_direction"
+
+  predicted_risk_column: "predicted_risk"
+
+  actual_risk_column: "actual_risk"
+
+  minimum_samples: 20
+
+
+# ============================================================
+# MODEL EVALUATION METRICS
+# ============================================================
+
+metrics:
+
+  enabled: true
+
+  calculate_return_mae: true
+
+  calculate_direction_accuracy: true
+
+  calculate_brier_score: true
+
+  calculate_risk_mae: true
+
+  calculate_win_rate: true
+
+  calculate_average_return: true
+
+
+# ============================================================
+# MONITORING
+# ============================================================
+
+monitoring:
+
+  enabled: true
+
+  health_score_enabled: true
+
+  evaluation_report: "data/reports/latest_evaluation.csv"
+
+  minimum_sample_size: 20
+
+  checks:
+
+    data_quality: true
+
+    model_performance: true
+
+    prediction_ledger: true
+
+    model_registry: true
+
+    drift_detection: true
+
+
+# ============================================================
+# HEALTH SCORE
+# ============================================================
+
+health:
+
+  enabled: true
+
+  healthy_threshold: 80
+
+  warning_threshold: 60
+
+  critical_threshold: 40
+
+  weights:
+
+    data_quality: 0.25
+
+    model_performance: 0.35
+
+    prediction_quality: 0.20
+
+    drift: 0.20
+
+
+# ============================================================
+# PERFORMANCE THRESHOLDS
+# ============================================================
+
+performance_thresholds:
+
+  minimum_direction_accuracy: 0.50
+
+  maximum_return_mae: 5.0
+
+  maximum_brier_score: 0.30
+
+  maximum_risk_mae: 5.0
+
+  minimum_win_rate: 0.45
 
 
 # ============================================================
@@ -285,11 +621,46 @@ drift:
 
   enabled: true
 
+  lookback_days: 30
+
+  baseline_days: 90
+
   minimum_samples: 20
 
   feature_drift_threshold: 0.20
 
-  performance_drift_threshold: 0.10
+  performance_drift_threshold: 0.15
+
+  critical_drift_threshold: 0.30
+
+
+# ============================================================
+# CIRCUIT BREAKER
+# ============================================================
+
+circuit_breaker:
+
+  enabled: true
+
+  state_file: "data/circuit_breaker/state.json"
+
+  fail_closed: true
+
+  allow_predictions_when_closed: true
+
+  allow_predictions_when_half_open: false
+
+  allow_predictions_when_open: false
+
+  open_health_score_threshold: 40
+
+  warning_health_score_threshold: 60
+
+  close_health_score_threshold: 80
+
+  max_consecutive_failures: 3
+
+  cooldown_minutes: 60
 
 
 # ============================================================
@@ -300,139 +671,63 @@ champion_challenger:
 
   enabled: true
 
-  minimum_samples: 20
+  registry_path: "data/models/model_registry.json"
 
-  promotion_margin: 0.02
+  champion_metric: "direction_accuracy"
 
+  challenger_minimum_improvement: 0.02
 
-# ============================================================
-# MODEL TUNING
-# ============================================================
+  minimum_evaluation_samples: 30
 
-tuning:
+  automatic_promotion: false
 
-  enabled: true
-
-  weekly_enabled: true
-
-  minimum_samples: 50
+  keep_previous_champion: true
 
 
 # ============================================================
-# SENTIMENT / NEWS
-# ============================================================
-
-sentiment:
-
-  enabled: true
-
-  lookback_hours: 24
-
-  minimum_articles: 1
-
-
-# ============================================================
-# PRODUCTION MONITORING
-# ============================================================
-
-monitoring:
-
-  enabled: true
-
-  paths:
-
-    ledger: data/ledger/predictions.csv
-
-    reports: data/reports
-
-    registry: data/model_registry.json
-
-    monitoring: data/monitoring
-
-
-  thresholds:
-
-    minimum_direction_accuracy: 0.45
-
-    maximum_return_mae: 0.10
-
-    maximum_brier_score: 0.30
-
-    maximum_risk_mae: 0.10
-
-    maximum_pending_predictions: 100
-
-    minimum_evaluated_predictions: 10
-
-
-  health:
-
-    healthy_score: 80
-
-    warning_score: 50
-
-
-# ============================================================
-# TELEGRAM ALERTS
-# ============================================================
-
-telegram_alerts:
-
-  enabled: true
-
-  # INFO / WARNING / CRITICAL
-  minimum_level: CRITICAL
-
-  # Avoid daily Telegram spam.
-  send_healthy_report: false
-
-
-# ============================================================
-# TELEGRAM PREDICTIONS
+# TELEGRAM
 # ============================================================
 
 telegram:
 
   enabled: true
 
-  send_predictions: true
+  bot_token: null
 
-  send_errors: true
+  chat_id: null
+
+  send_top_predictions: true
+
+  send_monitoring_alerts: true
+
+  send_circuit_breaker_alerts: true
+
+  max_predictions: 5
 
 
 # ============================================================
-# PIPELINE PATHS
+# SCHEDULING
 # ============================================================
 
-paths:
+schedule:
 
-  predictions: data/predictions
+  timezone: "Asia/Kolkata"
 
-  history: data/history
+  morning_job:
 
-  models: data/models
+    enabled: true
 
-  universes_dir: data/universes
+    hour: 9
 
-  reports: data/reports
+    minute: 0
 
-  monitoring: data/monitoring
+  evaluation_job:
 
-  ledger_file: data/ledger/predictions.csv
+    enabled: true
 
-  metrics_file: data/reports/latest_evaluation.csv
+    hour: 16
 
-  weekly_file: data/reports/weekly_evaluation.csv
-
-  drift_file: data/reports/latest_drift.json
-
-  ipo_file: data/ipo/ipos.csv
-
-  ipo_pipeline: data/ipo
-
-  registry_file: data/model_registry.json
-
-  errors_file: logs/errors.log
+    minute: 30
 
 
 # ============================================================
@@ -441,8 +736,27 @@ paths:
 
 logging:
 
-  level: INFO
+  level: "INFO"
 
-  directory: logs
+  directory: "logs"
 
-  file: logs/pipeline.log
+  filename: "market_prediction.log"
+
+  max_bytes: 10485760
+
+  backup_count: 5
+
+
+# ============================================================
+# DEVELOPMENT / DEBUG
+# ============================================================
+
+debug:
+
+  enabled: false
+
+  save_intermediate_data: false
+
+  print_predictions: false
+
+  mock_market_data: false
