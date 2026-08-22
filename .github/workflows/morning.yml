@@ -1,34 +1,20 @@
-name: Morning - Top 5 Prediction + Sentiment
+name: Morning - Stocks + Indexes + IPO Desk
 
 on:
   schedule:
-    # 08:45 IST = 03:15 UTC (Monday to Friday)
+    # 08:45 IST = 03:15 UTC (Mon–Fri)
     - cron: '15 3 * * 1-5'
-  workflow_dispatch:          # Manual trigger for testing
-
-- name: Light meta refresh
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python scripts/refresh_meta.py
-        continue-on-error: true
-
-      - name: Run Morning Job
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: python scripts/morning_job.py
+  workflow_dispatch:
 
 jobs:
-  morning-job:
+  morning:
     runs-on: ubuntu-latest
-    timeout-minutes: 55
+    timeout-minutes: 90
     permissions:
       contents: write
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Python 3.11
@@ -41,22 +27,31 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
+          pip install lxml html5lib
 
-      - name: Create necessary directories
+      - name: Create directories
         run: |
-          mkdir -p data/predictions data/history models
+          mkdir -p data/predictions data/history data/universes models
 
-      - name: Download previous models (if available)
+      - name: Download model artifacts
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
           name: models
           path: models
 
+      - name: Light meta refresh (holidays + IPO GMP)
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/refresh_meta.py
+
       - name: Run Morning Job
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: python scripts/morning_job.py
 
       - name: Upload models + predictions
@@ -68,10 +63,13 @@ jobs:
             data/predictions/
           retention-days: 14
 
-      - name: Commit prediction history
+      - name: Commit data files
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "data: morning predictions ${{ github.run_id }}"
-          file_pattern: "data/predictions/*.csv"
+          commit_message: "data: morning run ${{ github.run_id }}"
+          file_pattern: |
+            data/predictions/*.csv
+            data/holidays.json
+            data/ipo_pipeline.csv
           commit_user_name: github-actions[bot]
           commit_user_email: github-actions[bot]@users.noreply.github.com
