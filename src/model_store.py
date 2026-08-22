@@ -18,41 +18,75 @@ logger = logging.getLogger(__name__)
 
 MODEL_STORE_VERSION = "1.0"
 
+DEFAULT_MODEL_PATH = "data/models"
+
 
 class ModelStore:
     """Save and load trained models for individual symbols."""
 
     def __init__(
         self,
-        base_path: str | Path = "data/models",
+        base_path: str | Path = DEFAULT_MODEL_PATH,
     ) -> None:
-        self.base_path = Path(base_path)
+
+        self.base_path = Path(
+            base_path
+        )
+
         self.base_path.mkdir(
             parents=True,
             exist_ok=True,
+        )
+
+    # ========================================================
+    # PATH HELPERS
+    # ========================================================
+
+    def _safe_symbol(
+        self,
+        symbol: str,
+    ) -> str:
+        """Convert symbol into a safe directory name."""
+
+        return (
+            str(symbol)
+            .strip()
+            .replace("/", "_")
+            .replace("\\", "_")
+            .replace(":", "_")
+            .replace("*", "_")
+            .replace("?", "_")
+            .replace('"', "_")
+            .replace("<", "_")
+            .replace(">", "_")
+            .replace("|", "_")
         )
 
     def _symbol_path(
         self,
         symbol: str,
     ) -> Path:
-        """Return safe directory path for a symbol."""
+        """Return directory path for a symbol."""
 
-        safe_symbol = (
-            str(symbol)
-            .replace("/", "_")
-            .replace("\\", "_")
-            .replace(":", "_")
+        safe_symbol = self._safe_symbol(
+            symbol
         )
 
-        return self.base_path / safe_symbol
+        return (
+            self.base_path
+            / safe_symbol
+        )
 
     def _model_path(
         self,
         symbol: str,
     ) -> Path:
+        """Return model file path."""
+
         return (
-            self._symbol_path(symbol)
+            self._symbol_path(
+                symbol
+            )
             / "pipeline.joblib"
         )
 
@@ -60,21 +94,38 @@ class ModelStore:
         self,
         symbol: str,
     ) -> Path:
+        """Return metadata file path."""
+
         return (
-            self._symbol_path(symbol)
+            self._symbol_path(
+                symbol
+            )
             / "metadata.json"
         )
+
+    # ========================================================
+    # EXISTS
+    # ========================================================
 
     def exists(
         self,
         symbol: str,
     ) -> bool:
-        """Check whether a complete saved model exists."""
+        """Check whether a complete model exists."""
 
         return (
-            self._model_path(symbol).exists()
-            and self._metadata_path(symbol).exists()
+            self._model_path(
+                symbol
+            ).exists()
+            and
+            self._metadata_path(
+                symbol
+            ).exists()
         )
+
+    # ========================================================
+    # SAVE
+    # ========================================================
 
     def save(
         self,
@@ -82,7 +133,21 @@ class ModelStore:
         pipeline: Any,
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        """Save a trained pipeline and its metadata atomically."""
+        """
+        Save a trained model and metadata atomically.
+        """
+
+        if not symbol:
+
+            raise ValueError(
+                "symbol cannot be empty."
+            )
+
+        if pipeline is None:
+
+            raise ValueError(
+                "pipeline cannot be None."
+            )
 
         symbol_dir = self._symbol_path(
             symbol
@@ -105,34 +170,118 @@ class ModelStore:
             timezone.utc
         ).isoformat()
 
-        payload = {
-            "store_version": MODEL_STORE_VERSION,
-            "symbol": symbol,
+        # ----------------------------------------------------
+        # DEFAULT METADATA
+        # ----------------------------------------------------
+
+        payload: dict[str, Any] = {
+
+            "store_version": (
+                MODEL_STORE_VERSION
+            ),
+
+            "symbol": str(
+                symbol
+            ),
+
             "saved_at": now,
+
             "model_version": getattr(
                 pipeline,
                 "model_version",
                 "unknown",
             ),
+
+            "model_type": type(
+                pipeline
+            ).__name__,
+
             "training_rows": int(
                 getattr(
                     pipeline,
                     "training_rows",
-                    0,
+                    getattr(
+                        pipeline,
+                        "train_size",
+                        0,
+                    ),
                 )
                 or 0
             ),
         }
 
+        # ----------------------------------------------------
+        # MODEL METADATA
+        # ----------------------------------------------------
+
+        get_metadata = getattr(
+            pipeline,
+            "get_metadata",
+            None,
+        )
+
+        if callable(
+            get_metadata
+        ):
+
+            try:
+
+                model_metadata = (
+                    get_metadata()
+                )
+
+                if isinstance(
+                    model_metadata,
+                    dict,
+                ):
+
+                    payload.update(
+                        model_metadata
+                    )
+
+            except Exception:
+
+                logger.exception(
+                    "Could not collect model metadata "
+                    "for %s",
+                    symbol,
+                )
+
+        # ----------------------------------------------------
+        # USER METADATA
+        # ----------------------------------------------------
+
         if metadata:
+
             payload.update(
                 metadata
             )
 
+        # Always ensure these values exist.
+
+        payload["symbol"] = str(
+            symbol
+        )
+
+        payload.setdefault(
+            "saved_at",
+            now,
+        )
+
+        payload.setdefault(
+            "store_version",
+            MODEL_STORE_VERSION,
+        )
+
         model_tmp_path: Path | None = None
+
         metadata_tmp_path: Path | None = None
 
         try:
+
+            # ------------------------------------------------
+            # TEMP MODEL
+            # ------------------------------------------------
 
             with tempfile.NamedTemporaryFile(
                 mode="wb",
@@ -145,10 +294,16 @@ class ModelStore:
                     temp_model.name
                 )
 
+            # Write model.
+
             joblib.dump(
                 pipeline,
                 model_tmp_path,
             )
+
+            # ------------------------------------------------
+            # TEMP METADATA
+            # ------------------------------------------------
 
             with tempfile.NamedTemporaryFile(
                 mode="w",
@@ -169,6 +324,10 @@ class ModelStore:
                     sort_keys=True,
                     default=str,
                 )
+
+            # ------------------------------------------------
+            # ATOMIC REPLACE
+            # ------------------------------------------------
 
             os.replace(
                 model_tmp_path,
@@ -208,19 +367,44 @@ class ModelStore:
                 ):
 
                     try:
+
                         temporary_path.unlink()
 
                     except OSError:
 
                         pass
 
+    # ========================================================
+    # LOAD
+    # ========================================================
+
     def load(
         self,
         symbol: str,
-    ) -> tuple[Any, dict[str, Any]] | None:
-        """Load a pipeline and metadata for a symbol."""
+    ) -> tuple[
+        Any,
+        dict[str, Any],
+    ] | None:
+        """
+        Load a saved model and metadata.
 
-        if not self.exists(symbol):
+        Returns:
+
+            (model, metadata)
+
+        or:
+
+            None
+        """
+
+        if not self.exists(
+            symbol
+        ):
+
+            logger.debug(
+                "No saved model found for %s",
+                symbol,
+            )
 
             return None
 
@@ -234,6 +418,8 @@ class ModelStore:
 
         try:
 
+            # Load metadata first.
+
             with metadata_path.open(
                 "r",
                 encoding="utf-8",
@@ -243,8 +429,36 @@ class ModelStore:
                     file
                 )
 
+            # Load model.
+
             pipeline = joblib.load(
                 model_path
+            )
+
+            if pipeline is None:
+
+                logger.error(
+                    "Loaded model is None for %s",
+                    symbol,
+                )
+
+                return None
+
+            if not isinstance(
+                metadata,
+                dict,
+            ):
+
+                metadata = {}
+
+            metadata.setdefault(
+                "symbol",
+                str(symbol),
+            )
+
+            metadata.setdefault(
+                "model_source",
+                "FALLBACK",
             )
 
             logger.info(
@@ -265,6 +479,10 @@ class ModelStore:
             )
 
             return None
+
+    # ========================================================
+    # GET METADATA
+    # ========================================================
 
     def get_metadata(
         self,
@@ -287,9 +505,18 @@ class ModelStore:
                 encoding="utf-8",
             ) as file:
 
-                return json.load(
+                metadata = json.load(
                     file
                 )
+
+            if not isinstance(
+                metadata,
+                dict,
+            ):
+
+                return None
+
+            return metadata
 
         except Exception:
 
@@ -299,6 +526,10 @@ class ModelStore:
             )
 
             return None
+
+    # ========================================================
+    # DELETE
+    # ========================================================
 
     def delete(
         self,
@@ -336,6 +567,8 @@ class ModelStore:
                         path,
                     )
 
+        # Try to remove empty symbol directory.
+
         symbol_dir = self._symbol_path(
             symbol
         )
@@ -349,15 +582,28 @@ class ModelStore:
         except OSError:
 
             # Directory may contain
-            # additional files.
+            # other files.
             pass
 
+        if deleted:
+
+            logger.info(
+                "Deleted model for %s",
+                symbol,
+            )
+
         return deleted
+
+    # ========================================================
+    # LIST SYMBOLS
+    # ========================================================
 
     def list_symbols(
         self,
     ) -> list[str]:
-        """Return symbols with complete saved models."""
+        """
+        Return symbols with complete saved models.
+        """
 
         if not self.base_path.exists():
 
@@ -372,11 +618,13 @@ class ModelStore:
                 continue
 
             model_path = (
-                path / "pipeline.joblib"
+                path
+                / "pipeline.joblib"
             )
 
             metadata_path = (
-                path / "metadata.json"
+                path
+                / "metadata.json"
             )
 
             if (
@@ -391,3 +639,117 @@ class ModelStore:
         return sorted(
             symbols
         )
+
+
+# ============================================================
+# DEFAULT STORE
+# ============================================================
+
+_default_store = ModelStore()
+
+
+# ============================================================
+# COMPATIBILITY FUNCTIONS
+#
+# These functions are required because your existing
+# prediction_pipeline.py searches for:
+#
+#     src.model_store.load_model()
+#     src.model_store.get_model()
+#     src.model_store.load()
+# ============================================================
+
+def save_model(
+    symbol: str,
+    model: Any,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    """
+    Save a model using the default model store.
+    """
+
+    _default_store.save(
+        symbol=symbol,
+        pipeline=model,
+        metadata=metadata,
+    )
+
+
+def load_model(
+    symbol: str,
+) -> tuple[
+    Any,
+    dict[str, Any],
+] | None:
+    """
+    Load a model using the default model store.
+
+    This is the primary compatibility function
+    used by prediction_pipeline.py.
+    """
+
+    return _default_store.load(
+        symbol
+    )
+
+
+def get_model(
+    symbol: str,
+) -> tuple[
+    Any,
+    dict[str, Any],
+] | None:
+    """Alias for load_model()."""
+
+    return load_model(
+        symbol
+    )
+
+
+def load(
+    symbol: str,
+) -> tuple[
+    Any,
+    dict[str, Any],
+] | None:
+    """Alias for load_model()."""
+
+    return load_model(
+        symbol
+    )
+
+
+def model_exists(
+    symbol: str,
+) -> bool:
+    """Check whether a saved model exists."""
+
+    return _default_store.exists(
+        symbol
+    )
+
+
+def get_metadata(
+    symbol: str,
+) -> dict[str, Any] | None:
+    """Get model metadata."""
+
+    return _default_store.get_metadata(
+        symbol
+    )
+
+
+def delete_model(
+    symbol: str,
+) -> bool:
+    """Delete a saved model."""
+
+    return _default_store.delete(
+        symbol
+    )
+
+
+def list_models() -> list[str]:
+    """Return all symbols with saved models."""
+
+    return _default_store.list_symbols()
