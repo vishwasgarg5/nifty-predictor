@@ -46,15 +46,17 @@ def filter_eligible_ipos() -> list:
             out.append(sym)
     return out
 
-def ipo_watchlist_telegram_lines(max_rows=8) -> list:
+def ipo_watchlist_telegram_lines(max_rows: int = 8) -> list:
     df = load_ipo_watchlist()
     if df.empty:
         return []
     eligible = set(filter_eligible_ipos())
     lines = ["*LISTED IPO WATCHLIST*"]
     for _, row in df.head(max_rows).iterrows():
-        sym = str(row["Symbol"])
-        key = sym if sym.endswith(".NS") else sym + ".NS"
+        sym = str(row.get("Symbol", ""))
+        key = sym if sym.endswith(".NS") else (sym + ".NS" if sym else "")
         st = "ACTIVE" if key in eligible else "WATCH"
-        lines.append(f"• `{sym.replace('.NS','')}` | {st} | {str(row.get('ListingDate,''))[:10]}")
+        listing = str(row.get("ListingDate", "") or "")[:10]
+        clean = sym.replace(".NS", "")
+        lines.append(f"• `{clean}` | {st} | {listing}")
     return lines
