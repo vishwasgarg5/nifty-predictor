@@ -3,27 +3,8 @@
 """
 Dynamic Production Model Loader.
 
-This module loads the currently registered Champion model
+Loads the currently registered Champion model
 from the production model registry.
-
-Loading flow:
-
-    Model Registry
-          │
-          ▼
-    Current Champion
-          │
-          ▼
-    Validate model path
-          │
-          ▼
-    Load serialized model
-          │
-          ▼
-    Unwrap training payload if necessary
-          │
-          ▼
-    Return ProductionModel
 
 Supported formats:
 
@@ -31,18 +12,17 @@ Supported formats:
     .pkl
     .pickle
 
-Supported saved structures:
-
-    ProductionModel
-
-or:
+Also supports training payloads saved as:
 
     {
         "model": ProductionModel,
-        "metadata": {...},
+        "metadata": {...}
     }
 
-The second format is used by train_model.py.
+The public function used by the prediction
+pipeline is:
+
+    load_champion_model()
 """
 
 from __future__ import annotations
@@ -58,9 +38,7 @@ from typing import Any
 # PROJECT ROOT
 # ============================================================
 
-PROJECT_ROOT = Path(
-    __file__
-).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 if str(PROJECT_ROOT) not in sys.path:
 
@@ -90,12 +68,11 @@ _MODEL_CACHE: dict[
 
 
 # ============================================================
-# LOAD MODEL FILE
+# LOAD SERIALIZED FILE
 # ============================================================
 
 def load_model_file(
     model_path: str | Path,
-    use_cache: bool = True,
 ) -> Any:
     """
     Load a serialized model file.
@@ -105,9 +82,6 @@ def load_model_file(
         .joblib
         .pkl
         .pickle
-
-    Returns the raw object stored inside
-    the serialized file.
     """
 
     path = Path(
@@ -125,14 +99,7 @@ def load_model_file(
         path.resolve()
     )
 
-    # --------------------------------------------------------
-    # CACHE
-    # --------------------------------------------------------
-
-    if (
-        use_cache
-        and cache_key in _MODEL_CACHE
-    ):
+    if cache_key in _MODEL_CACHE:
 
         logger.info(
             "Using cached model: %s",
@@ -143,15 +110,9 @@ def load_model_file(
             cache_key
         ]
 
-    # --------------------------------------------------------
-    # FILE EXTENSION
-    # --------------------------------------------------------
+    suffix = path.suffix.lower()
 
-    suffix = (
-        path.suffix.lower()
-    )
-
-    model: Any = None
+    loaded: Any = None
 
     # --------------------------------------------------------
     # JOBLIB
@@ -163,22 +124,15 @@ def load_model_file(
 
             import joblib
 
-            model = joblib.load(
+            loaded = joblib.load(
                 path
             )
 
         except ImportError as error:
 
             raise RuntimeError(
-                "joblib is required to "
-                "load this model."
-            ) from error
-
-        except Exception as error:
-
-            raise RuntimeError(
-                "Could not load joblib model: "
-                f"{path}"
+                "joblib is required "
+                "to load this model."
             ) from error
 
     # --------------------------------------------------------
@@ -196,28 +150,26 @@ def load_model_file(
                 "rb"
             ) as file:
 
-                model = pickle.load(
+                loaded = pickle.load(
                     file
                 )
 
         except Exception as pickle_error:
 
-            # Try joblib as fallback.
-
             try:
 
                 import joblib
 
-                model = joblib.load(
+                loaded = joblib.load(
                     path
                 )
 
-            except Exception as joblib_error:
+            except Exception as error:
 
                 raise RuntimeError(
                     "Could not load model file: "
                     f"{path}"
-                ) from joblib_error
+                ) from pickle_error
 
     # --------------------------------------------------------
     # UNKNOWN FORMAT
@@ -225,23 +177,15 @@ def load_model_file(
 
     else:
 
-        # Try joblib first.
-
         try:
 
             import joblib
 
-            model = joblib.load(
+            loaded = joblib.load(
                 path
             )
 
         except Exception:
-
-            model = None
-
-        # Try pickle.
-
-        if model is None:
 
             try:
 
@@ -249,7 +193,7 @@ def load_model_file(
                     "rb"
                 ) as file:
 
-                    model = pickle.load(
+                    loaded = pickle.load(
                         file
                     )
 
@@ -260,36 +204,30 @@ def load_model_file(
                     f"model format: {path}"
                 ) from error
 
-    # --------------------------------------------------------
-    # CACHE RESULT
-    # --------------------------------------------------------
-
-    if use_cache:
-
-        _MODEL_CACHE[
-            cache_key
-        ] = model
+    _MODEL_CACHE[
+        cache_key
+    ] = loaded
 
     logger.info(
         "Loaded model file: %s",
         path,
     )
 
-    return model
+    return loaded
 
 
 # ============================================================
-# UNWRAP MODEL PAYLOAD
+# EXTRACT MODEL PAYLOAD
 # ============================================================
 
-def unwrap_model_payload(
+def extract_model_payload(
     loaded: Any,
 ) -> tuple[
     Any,
     dict[str, Any],
 ]:
     """
-    Extract the actual model and saved metadata.
+    Extract the actual prediction model.
 
     Supports either:
 
@@ -299,57 +237,41 @@ def unwrap_model_payload(
 
         {
             "model": ProductionModel,
-            "metadata": {...},
+            "metadata": {...}
         }
     """
-
-    # --------------------------------------------------------
-    # TRAIN_MODEL.PY FORMAT
-    # --------------------------------------------------------
 
     if isinstance(
         loaded,
         dict,
     ):
 
-        if "model" in loaded:
+        model = loaded.get(
+            "model"
+        )
 
-            model = loaded.get(
-                "model"
+        metadata = loaded.get(
+            "metadata",
+            {},
+        )
+
+        if model is None:
+
+            raise RuntimeError(
+                "Saved model payload does not "
+                "contain a 'model' entry."
             )
 
-            metadata = loaded.get(
-                "metadata",
-                {},
-            )
+        if not isinstance(
+            metadata,
+            dict,
+        ):
 
-            if not isinstance(
-                metadata,
-                dict,
-            ):
+            metadata = {}
 
-                metadata = {}
-
-            if model is None:
-
-                raise RuntimeError(
-                    "Saved model payload contains "
-                    "no model."
-                )
-
-            return (
-                model,
-                dict(metadata),
-            )
-
-    # --------------------------------------------------------
-    # RAW MODEL FORMAT
-    # --------------------------------------------------------
-
-    if loaded is None:
-
-        raise RuntimeError(
-            "Loaded model is None."
+        return (
+            model,
+            dict(metadata),
         )
 
     return (
@@ -369,8 +291,7 @@ def load_champion_model(
     dict[str, Any],
 ]:
     """
-    Load the currently registered
-    production Champion.
+    Load the currently registered production Champion.
 
     Returns:
 
@@ -383,10 +304,6 @@ def load_champion_model(
         get_champion_path,
     )
 
-    # --------------------------------------------------------
-    # GET CHAMPION
-    # --------------------------------------------------------
-
     champion = get_champion()
 
     if champion is None:
@@ -396,13 +313,7 @@ def load_champion_model(
             "is registered."
         )
 
-    # --------------------------------------------------------
-    # GET MODEL PATH
-    # --------------------------------------------------------
-
-    model_path = (
-        get_champion_path()
-    )
+    model_path = get_champion_path()
 
     if model_path is None:
 
@@ -422,21 +333,33 @@ def load_champion_model(
             f"{model_path}"
         )
 
+    cache_key = str(
+        model_path.resolve()
+    )
+
+    if (
+        not use_cache
+        and cache_key in _MODEL_CACHE
+    ):
+
+        del _MODEL_CACHE[
+            cache_key
+        ]
+
     # --------------------------------------------------------
     # LOAD FILE
     # --------------------------------------------------------
 
     loaded = load_model_file(
-        model_path=model_path,
-        use_cache=use_cache,
+        model_path
     )
 
     # --------------------------------------------------------
-    # UNWRAP PAYLOAD
+    # EXTRACT ACTUAL MODEL
     # --------------------------------------------------------
 
     model, saved_metadata = (
-        unwrap_model_payload(
+        extract_model_payload(
             loaded
         )
     )
@@ -456,27 +379,9 @@ def load_champion_model(
     ):
 
         raise RuntimeError(
-            "Loaded Champion does not "
-            "provide predict()."
+            "Loaded Champion model does not "
+            "provide a callable predict() method."
         )
-
-    # --------------------------------------------------------
-    # REGISTRY METADATA
-    # --------------------------------------------------------
-
-    registry_metadata = (
-        champion.get(
-            "metadata",
-            {},
-        )
-    )
-
-    if not isinstance(
-        registry_metadata,
-        dict,
-    ):
-
-        registry_metadata = {}
 
     # --------------------------------------------------------
     # COMBINE METADATA
@@ -484,21 +389,12 @@ def load_champion_model(
 
     metadata: dict[
         str,
-        Any,
+        Any
     ] = {}
 
-    # Saved metadata comes first.
-
-    if isinstance(
-        saved_metadata,
-        dict,
-    ):
-
-        metadata.update(
-            saved_metadata
-        )
-
-    # Registry metadata is included separately.
+    metadata.update(
+        saved_metadata
+    )
 
     metadata.update(
         {
@@ -526,67 +422,31 @@ def load_champion_model(
                 "promoted_at"
             ),
 
-            "registry_metadata": (
-                registry_metadata
+            "registry_metadata": champion.get(
+                "metadata",
+                {},
             ),
-
-            "saved_metadata": (
-                saved_metadata
-            ),
-
-            "loaded": True,
-
-            "error": None,
         }
     )
 
-    # --------------------------------------------------------
-    # MODEL VERSION
-    # --------------------------------------------------------
-
-    if (
-        "model_version"
-        not in metadata
-    ):
-
-        model_version = getattr(
+    metadata.setdefault(
+        "model_version",
+        getattr(
             model,
             "model_version",
-            None,
-        )
-
-        if model_version is not None:
-
-            metadata[
-                "model_version"
-            ] = model_version
-
-    # --------------------------------------------------------
-    # MODEL NAME
-    # --------------------------------------------------------
-
-    if (
-        "model_name"
-        not in metadata
-    ):
-
-        metadata[
-            "model_name"
-        ] = type(
-            model
-        ).__name__
+            "unknown",
+        ),
+    )
 
     logger.info(
         "Production Champion loaded | "
         "name=%s | path=%s | "
-        "type=%s",
+        "model_type=%s",
         metadata.get(
             "name"
         ),
         model_path,
-        type(
-            model
-        ).__name__,
+        type(model).__name__,
     )
 
     return (
@@ -596,7 +456,29 @@ def load_champion_model(
 
 
 # ============================================================
-# SAFE CHAMPION LOADER
+# COMPATIBILITY ALIASES
+# ============================================================
+
+def load_production_model() -> tuple[
+    Any,
+    dict[str, Any],
+]:
+    """Compatibility alias."""
+
+    return load_champion_model()
+
+
+def load_active_model() -> tuple[
+    Any,
+    dict[str, Any],
+]:
+    """Compatibility alias."""
+
+    return load_champion_model()
+
+
+# ============================================================
+# SAFE LOADER
 # ============================================================
 
 def try_load_champion_model() -> tuple[
@@ -604,13 +486,11 @@ def try_load_champion_model() -> tuple[
     dict[str, Any],
 ]:
     """
-    Safely attempt to load
-    the production Champion.
+    Safely attempt to load the Champion.
 
     Returns:
 
         model or None
-
         metadata/status
     """
 
@@ -620,13 +500,9 @@ def try_load_champion_model() -> tuple[
             load_champion_model()
         )
 
-        metadata[
-            "loaded"
-        ] = True
+        metadata["loaded"] = True
 
-        metadata[
-            "error"
-        ] = None
+        metadata["error"] = None
 
         return (
             model,
@@ -657,34 +533,6 @@ def try_load_champion_model() -> tuple[
 
 
 # ============================================================
-# COMPATIBILITY ALIASES
-# ============================================================
-
-def load_production_model() -> tuple[
-    Any,
-    dict[str, Any],
-]:
-    """
-    Compatibility alias for
-    load_champion_model().
-    """
-
-    return load_champion_model()
-
-
-def load_active_model() -> tuple[
-    Any,
-    dict[str, Any],
-]:
-    """
-    Compatibility alias for
-    load_champion_model().
-    """
-
-    return load_champion_model()
-
-
-# ============================================================
 # CACHE MANAGEMENT
 # ============================================================
 
@@ -692,11 +540,7 @@ def clear_model_cache() -> None:
     """
     Clear all cached models.
 
-    Call this after:
-
-        - promoting a new Champion
-        - replacing a model file
-        - retraining production models
+    Useful after model promotion.
     """
 
     _MODEL_CACHE.clear()
@@ -706,22 +550,12 @@ def clear_model_cache() -> None:
     )
 
 
-def get_cache_size() -> int:
-    """Return the number of cached models."""
-
-    return len(
-        _MODEL_CACHE
-    )
-
-
 # ============================================================
 # CLI TEST
 # ============================================================
 
 def main() -> int:
-    """
-    Test Champion model loading.
-    """
+    """Test Champion model loading."""
 
     model, metadata = (
         try_load_champion_model()
@@ -729,17 +563,13 @@ def main() -> int:
 
     print()
 
-    print(
-        "=" * 70
-    )
+    print("=" * 70)
 
     print(
         "PRODUCTION MODEL LOADER"
     )
 
-    print(
-        "=" * 70
-    )
+    print("=" * 70)
 
     print()
 
@@ -747,13 +577,6 @@ def main() -> int:
         "Loaded:",
         metadata.get(
             "loaded"
-        ),
-    )
-
-    print(
-        "Model source:",
-        metadata.get(
-            "model_source"
         ),
     )
 
@@ -772,9 +595,9 @@ def main() -> int:
     )
 
     print(
-        "Version:",
+        "Source:",
         metadata.get(
-            "model_version"
+            "model_source"
         ),
     )
 
@@ -785,7 +608,7 @@ def main() -> int:
         print()
 
         print(
-            "ERROR:",
+            "Error:",
             metadata.get(
                 "error"
             ),
@@ -796,23 +619,22 @@ def main() -> int:
     print()
 
     print(
-        "Model class:",
-        type(
-            model
-        ).__name__,
+        "Model type:",
+        type(model).__name__,
+    )
+
+    print(
+        "Model version:",
+        metadata.get(
+            "model_version"
+        ),
     )
 
     print()
 
     print(
-        "Has predict():",
-        callable(
-            getattr(
-                model,
-                "predict",
-                None,
-            )
-        ),
+        "SUCCESS: Champion model "
+        "loaded correctly."
     )
 
     return 0
