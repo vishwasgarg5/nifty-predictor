@@ -1,4 +1,4 @@
-name: Daily Stock Prediction Pipeline
+name: Daily Market Prediction Pipeline
 
 on:
 
@@ -6,67 +6,55 @@ on:
 
   schedule:
 
-    # Morning prediction job
-    # 09:00 IST
+    # Runs Monday to Friday.
+    #
+    # 03:30 UTC = 09:00 AM IST
+    #
+    # GitHub Actions cron always uses UTC.
     - cron: "30 3 * * 1-5"
-
-    # Evening evaluation job
-    # 17:00 IST
-    - cron: "30 11 * * 1-5"
 
 
 permissions:
   contents: write
 
 
-concurrency:
-
-  group: stock-prediction-pipeline
-
-  cancel-in-progress: false
-
-
 jobs:
 
-  morning-prediction:
-
-    name: Morning Prediction Pipeline
+  daily-pipeline:
 
     runs-on: ubuntu-latest
-
-    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '30 3 * * 1-5'
 
     timeout-minutes: 30
 
 
     steps:
 
-      # --------------------------------------------------------
+      # ======================================================
       # CHECKOUT
-      # --------------------------------------------------------
+      # ======================================================
 
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
 
-      # --------------------------------------------------------
+      # ======================================================
       # PYTHON
-      # --------------------------------------------------------
+      # ======================================================
 
       - name: Set up Python
         uses: actions/setup-python@v5
+
         with:
           python-version: "3.11"
 
 
-      # --------------------------------------------------------
-      # CACHE
-      # --------------------------------------------------------
+      # ======================================================
+      # DEPENDENCY CACHE
+      # ======================================================
 
       - name: Cache Python dependencies
         uses: actions/cache@v4
+
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
@@ -74,9 +62,9 @@ jobs:
             ${{ runner.os }}-pip-
 
 
-      # --------------------------------------------------------
-      # INSTALL
-      # --------------------------------------------------------
+      # ======================================================
+      # INSTALL DEPENDENCIES
+      # ======================================================
 
       - name: Install dependencies
         run: |
@@ -84,209 +72,75 @@ jobs:
           pip install -r requirements.txt
 
 
-      # --------------------------------------------------------
-      # CREATE DIRECTORIES
-      # --------------------------------------------------------
+      # ======================================================
+      # CREATE REQUIRED DIRECTORIES
+      # ======================================================
 
-      - name: Create required directories
+      - name: Create data directories
         run: |
-          mkdir -p data/predictions
-          mkdir -p data/history
-          mkdir -p data/models
-          mkdir -p data/universes
-          mkdir -p data/reports
-          mkdir -p data/monitoring
           mkdir -p data/ledger
-          mkdir -p data/ipo
-          mkdir -p logs
+          mkdir -p data/models
+          mkdir -p data/monitoring
 
 
-      # --------------------------------------------------------
-      # RUN MORNING JOB
-      # --------------------------------------------------------
+      # ======================================================
+      # MORNING PREDICTION PIPELINE
+      # ======================================================
 
-      - name: Run morning prediction job
+      - name: Run Morning Prediction Pipeline
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
         run: |
           python scripts/morning_job.py
 
 
-      # --------------------------------------------------------
-      # UPLOAD ARTIFACTS
-      # --------------------------------------------------------
+      # ======================================================
+      # ACTUAL OUTCOME EVALUATION
+      # ======================================================
 
-      - name: Upload morning artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: morning-pipeline-${{ github.run_id }}
-          path: |
-            data/predictions/
-            data/ledger/
-            data/reports/
-            data/monitoring/
-            data/model_registry.json
-            logs/
-          if-no-files-found: warn
-          retention-days: 30
-
-
-      # --------------------------------------------------------
-      # COMMIT RESULTS
-      # --------------------------------------------------------
-
-      - name: Commit morning pipeline results
-        if: always()
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add \
-            data/predictions/ \
-            data/history/ \
-            data/models/ \
-            data/universes/ \
-            data/ledger/ \
-            data/reports/ \
-            data/monitoring/ \
-            data/ipo/ \
-            data/model_registry.json \
-            logs/ || true
-
-          if git diff --cached --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "Automated morning predictions [skip ci]"
-            git push
-          fi
-
-
-  evening-evaluation:
-
-    name: Evening Evaluation Pipeline
-
-    runs-on: ubuntu-latest
-
-    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '30 11 * * 1-5'
-
-    timeout-minutes: 30
-
-
-    steps:
-
-      # --------------------------------------------------------
-      # CHECKOUT
-      # --------------------------------------------------------
-
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-
-      # --------------------------------------------------------
-      # PYTHON
-      # --------------------------------------------------------
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-
-      # --------------------------------------------------------
-      # CACHE
-      # --------------------------------------------------------
-
-      - name: Cache Python dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-
-      # --------------------------------------------------------
-      # INSTALL
-      # --------------------------------------------------------
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-
-      # --------------------------------------------------------
-      # CREATE DIRECTORIES
-      # --------------------------------------------------------
-
-      - name: Create required directories
-        run: |
-          mkdir -p data/predictions
-          mkdir -p data/history
-          mkdir -p data/models
-          mkdir -p data/universes
-          mkdir -p data/reports
-          mkdir -p data/monitoring
-          mkdir -p data/ledger
-          mkdir -p data/ipo
-          mkdir -p logs
-
-
-      # --------------------------------------------------------
-      # RUN EVALUATION JOB
-      # --------------------------------------------------------
-
-      - name: Run evening evaluation job
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      - name: Resolve Actual Market Outcomes
         run: |
           python scripts/evaluation_job.py
 
 
-      # --------------------------------------------------------
-      # UPLOAD ARTIFACTS
-      # --------------------------------------------------------
+      # ======================================================
+      # PRODUCTION MONITORING
+      # ======================================================
 
-      - name: Upload evaluation artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: evaluation-job-${{ github.run_id }}
-          path: |
-            data/ledger/
-            data/reports/
-            data/monitoring/
-            data/model_registry.json
-            logs/
-          if-no-files-found: warn
-          retention-days: 30
+      - name: Run Production Monitoring
+        run: |
+          python src/monitoring.py
 
 
-      # --------------------------------------------------------
-      # COMMIT RESULTS
-      # --------------------------------------------------------
+      # ======================================================
+      # CHAMPION / CHALLENGER
+      # ======================================================
 
-      - name: Commit evaluation and monitoring results
-        if: always()
+      - name: Run Champion Challenger Evaluation
+        run: |
+          python scripts/champion_challenger_job.py
+
+
+      # ======================================================
+      # SAVE GENERATED DATA
+      # ======================================================
+
+      - name: Commit pipeline data
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add \
-            data/ledger/ \
-            data/reports/ \
-            data/monitoring/ \
-            data/model_registry.json \
-            logs/ || true
+            data/ledger/predictions.csv \
+            data/models \
+            data/monitoring \
+            2>/dev/null || true
 
           if git diff --cached --quiet; then
-            echo "No changes to commit"
+            echo "No generated data changes to commit."
           else
-            git commit -m "Automated evaluation and monitoring [skip ci]"
+            git commit -m "Update market prediction pipeline data"
             git push
           fi
