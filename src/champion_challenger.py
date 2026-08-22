@@ -1,30 +1,35 @@
-"""Champion / Challenger model comparison.
+#!/usr/bin/env python3
 
-Compares the current production model (Champion) against a
-new candidate model (Challenger) using evaluated predictions.
+"""
+Champion / Challenger Evaluation and Promotion Engine.
 
-Metrics:
+Responsibilities
+----------------
+1. Load evaluated predictions from the prediction ledger.
+2. Identify the current Champion and Challenger models.
+3. Compare models on common evaluated predictions.
+4. Calculate:
+   - Return MAE
+   - Direction Accuracy
+   - Brier Score
+   - Risk MAE
+5. Apply a promotion gate.
+6. Promote a Challenger only when it has enough evidence and
+   outperforms the Champion.
+7. Update data/model_registry.json.
 
-    Lower is better:
-        - Return MAE
-        - Brier Score
-        - Risk MAE
-
-    Higher is better:
-        - Direction Accuracy
-
-The challenger is promoted only when:
-
-    1. Enough evaluated predictions exist.
-    2. The challenger performs better overall.
-    3. The configured minimum improvement is achieved.
-    4. Auto-promotion is enabled, or the result is returned
-       for manual approval.
+This module does not train models or generate predictions.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+import logging
+import sys
+
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -32,13 +37,25 @@ import pandas as pd
 
 
 # ============================================================
-# DEFAULT CONFIGURATION
+# PROJECT ROOT
+# ============================================================
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# CONFIG
 # ============================================================
 
 DEFAULT_CONFIG = {
     "enabled": True,
     "champion": "current",
-    "challenger": "challenger_v1",
     "minimum_evaluations": 30,
     "comparison_window": 50,
     "minimum_improvement": 0.02,
@@ -51,912 +68,1137 @@ DEFAULT_CONFIG = {
 }
 
 
+def load_champion_challenger_config() -> dict[str, Any]:
+    """Load champion/challenger settings with safe defaults."""
+
+    config = DEFAULT_CONFIG.copy()
+
+    try:
+        from src.config import cfg
+
+        section = getattr(cfg, "champion_challenger", None)
+
+        if section is None:
+            return config
+
+        if isinstance(section, dict):
+            config.update(section)
+            return config
+
+        if hasattr(section, "items"):
+            config.update(dict(section.items()))
+            return config
+
+        if hasattr(section, "__dict__"):
+            config.update(
+                {
+                    key: value
+                    for key, value in vars(section).items()
+                    if not key.startswith("_")
+                }
+            )
+
+    except Exception as error:
+        logger.debug(
+            "Could not load champion/challenger config: %s",
+            error,
+        )
+
+    return config
+
+
 # ============================================================
-# RESULT
+# PATHS
+# ============================================================
+
+def resolve_project_path(value: str | Path) -> Path:
+    """Resolve paths relative to the repository root."""
+
+    path = Path(value)
+
+    if path.is_absolute():
+        return path
+
+    return PROJECT_ROOT / path
+
+
+# ============================================================
+# DATA CLASSES
 # ============================================================
 
 @dataclass
-class ComparisonResult:
-    """Champion / Challenger comparison result."""
-
-    champion_name: str
-    challenger_name: str
-
-    champion_records: int
-    challenger_records: int
-
-    comparison_window: int
-
-    champion_metrics: dict[str, float]
-    challenger_metrics: dict[str, float]
-
-    metric_improvements: dict[str, float]
-
-    champion_score: float
-    challenger_score: float
-
-    overall_improvement: float
-
-    winner: str
-
-    promotion_recommended: bool
-    auto_promoted: bool
-
-    reasons: list[str]
-    recommendation: str
+class ModelMetrics:
+    model_name: str
+    sample_count: int
+    return_mae: float | None
+    direction_accuracy: float | None
+    brier_score: float | None
+    risk_mae: float | None
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert result to dictionary."""
+        return asdict(self)
 
-        return {
-            "champion_name": self.champion_name,
-            "challenger_name": self.challenger_name,
 
-            "champion_records": self.champion_records,
-            "challenger_records": self.challenger_records,
+@dataclass
+class PromotionDecision:
+    challenger_name: str
+    champion_name: str
+    eligible: bool
+    better_than_champion: bool
+    improvement_score: float
+    minimum_improvement: float
+    sample_count: int
+    reasons: list[str]
+    promoted: bool = False
 
-            "comparison_window": self.comparison_window,
-
-            "champion_metrics": self.champion_metrics,
-            "challenger_metrics": self.challenger_metrics,
-
-            "metric_improvements": self.metric_improvements,
-
-            "champion_score": self.champion_score,
-            "challenger_score": self.challenger_score,
-
-            "overall_improvement": self.overall_improvement,
-
-            "winner": self.winner,
-
-            "promotion_recommended": (
-                self.promotion_recommended
-            ),
-
-            "auto_promoted": self.auto_promoted,
-
-            "reasons": self.reasons,
-
-            "recommendation": self.recommendation,
-        }
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 # ============================================================
-# HELPERS
+# REGISTRY
 # ============================================================
 
-def safe_mean(
-    series: pd.Series | None,
-) -> float | None:
-    """Return numeric mean safely."""
-
-    if series is None:
-        return None
-
-    values = pd.to_numeric(
-        series,
-        errors="coerce",
-    ).dropna()
-
-    if values.empty:
-        return None
-
-    value = float(values.mean())
-
-    if not np.isfinite(value):
-        return None
-
-    return value
+def empty_registry() -> dict[str, Any]:
+    return {
+        "champion": {
+            "model_name": "current",
+            "model_path": None,
+            "status": "CHAMPION",
+        },
+        "challengers": [],
+        "history": [],
+    }
 
 
-def get_evaluated_records(
-    frame: pd.DataFrame,
-) -> pd.DataFrame:
-    """Return evaluated records only."""
+def load_model_registry(
+    registry_path: str | Path = "data/model_registry.json",
+) -> dict[str, Any]:
+    """Load the model registry."""
 
-    if frame is None or frame.empty:
-        return pd.DataFrame()
+    path = resolve_project_path(registry_path)
 
-    result = frame.copy()
+    if not path.exists():
+        return empty_registry()
 
-    if "evaluation_status" in result.columns:
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            registry = json.load(file)
 
-        status = (
-            result["evaluation_status"]
-            .astype(str)
-            .str.upper()
+        if not isinstance(registry, dict):
+            return empty_registry()
+
+        registry.setdefault("champion", None)
+        registry.setdefault("challengers", [])
+        registry.setdefault("history", [])
+
+        return registry
+
+    except Exception as error:
+        logger.error(
+            "Unable to load model registry: %s",
+            error,
         )
 
-        result = result.loc[
-            status == "EVALUATED"
-        ].copy()
+        return empty_registry()
 
-    # Sort by date when possible.
-    date_column = None
 
-    for candidate in (
-        "market_date",
-        "date",
-        "evaluated_at",
-        "prediction_date",
-        "created_at",
-    ):
+def save_model_registry(
+    registry: dict[str, Any],
+    registry_path: str | Path = "data/model_registry.json",
+) -> Path:
+    """Atomically save the model registry."""
 
-        if candidate in result.columns:
-            date_column = candidate
-            break
+    path = resolve_project_path(registry_path)
 
-    if date_column:
-
-        result["_comparison_date"] = (
-            pd.to_datetime(
-                result[date_column],
-                errors="coerce",
-            )
-        )
-
-        result = result.sort_values(
-            "_comparison_date",
-            ascending=True,
-            na_position="last",
-        )
-
-    return result.reset_index(
-        drop=True
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
     )
 
+    temporary_path = path.with_suffix(".tmp")
 
-def calculate_metrics(
-    frame: pd.DataFrame,
-) -> dict[str, float]:
-    """Calculate supported performance metrics."""
-
-    if frame is None or frame.empty:
-        return {}
-
-    metrics: dict[str, float] = {}
-
-    if "return_absolute_error" in frame.columns:
-
-        value = safe_mean(
-            frame["return_absolute_error"]
+    with open(
+        temporary_path,
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(
+            registry,
+            file,
+            indent=2,
+            default=str,
         )
 
-        if value is not None:
-            metrics["return_mae"] = value
+    temporary_path.replace(path)
 
-    if "direction_correct" in frame.columns:
-
-        value = safe_mean(
-            frame["direction_correct"]
-        )
-
-        if value is not None:
-            metrics["direction_accuracy"] = value
-
-    if "brier_score" in frame.columns:
-
-        value = safe_mean(
-            frame["brier_score"]
-        )
-
-        if value is not None:
-            metrics["brier_score"] = value
-
-    if "risk_absolute_error" in frame.columns:
-
-        value = safe_mean(
-            frame["risk_absolute_error"]
-        )
-
-        if value is not None:
-            metrics["risk_mae"] = value
-
-    return metrics
+    return path
 
 
 # ============================================================
-# MODEL FILTERING
+# LEDGER
 # ============================================================
 
-def filter_model_records(
-    ledger: pd.DataFrame,
-    model_name: str,
+def load_evaluated_predictions(
+    ledger_path: str | Path = "data/ledger/predictions.csv",
 ) -> pd.DataFrame:
-    """Filter ledger records belonging to a model.
-
-    Supported model identifier columns:
-
-        model_name
-        model_version
-        model
-        model_id
+    """
+    Load only predictions that have actual outcomes available.
     """
 
-    if ledger is None or ledger.empty:
+    path = resolve_project_path(ledger_path)
+
+    if not path.exists():
+        logger.warning("Prediction ledger not found: %s", path)
         return pd.DataFrame()
 
-    frame = get_evaluated_records(
-        ledger
-    )
+    try:
+        frame = pd.read_csv(path)
+    except Exception as error:
+        logger.error("Unable to read prediction ledger: %s", error)
+        return pd.DataFrame()
 
     if frame.empty:
         return frame
 
-    model_column = None
+    if "model_name" not in frame.columns:
+        frame["model_name"] = "current"
 
-    for candidate in (
-        "model_name",
-        "model_version",
-        "model",
-        "model_id",
-    ):
+    if "evaluation_status" in frame.columns:
+        evaluated = frame[
+            frame["evaluation_status"]
+            .astype(str)
+            .str.upper()
+            .eq("EVALUATED")
+        ].copy()
+    else:
+        evaluated = frame.copy()
 
-        if candidate in frame.columns:
-            model_column = candidate
-            break
+    actual_columns = [
+        "actual_return",
+        "actual_direction",
+        "actual_close",
+    ]
 
-    if model_column is None:
+    available_actual_columns = [
+        column
+        for column in actual_columns
+        if column in evaluated.columns
+    ]
+
+    if not available_actual_columns:
+        logger.warning(
+            "Ledger contains no recognized actual outcome columns."
+        )
         return pd.DataFrame()
 
-    values = (
-        frame[model_column]
-        .astype(str)
-        .str.strip()
-        .str.lower()
+    return evaluated.reset_index(drop=True)
+
+
+# ============================================================
+# COLUMN HELPERS
+# ============================================================
+
+def first_existing_column(
+    frame: pd.DataFrame,
+    candidates: list[str],
+) -> str | None:
+    for column in candidates:
+        if column in frame.columns:
+            return column
+    return None
+
+
+def numeric_series(
+    frame: pd.DataFrame,
+    column: str | None,
+) -> pd.Series:
+    if column is None:
+        return pd.Series(np.nan, index=frame.index)
+
+    return pd.to_numeric(
+        frame[column],
+        errors="coerce",
     )
 
-    target = str(
-        model_name
-    ).strip().lower()
 
-    return frame.loc[
-        values == target
+# ============================================================
+# METRICS
+# ============================================================
+
+def calculate_model_metrics(
+    predictions: pd.DataFrame,
+    model_name: str,
+) -> ModelMetrics:
+    """Calculate evaluation metrics for one model."""
+
+    frame = predictions[
+        predictions["model_name"]
+        .astype(str)
+        .eq(str(model_name))
     ].copy()
 
+    sample_count = len(frame)
 
-# ============================================================
-# METRIC IMPROVEMENT
-# ============================================================
-
-def calculate_improvement(
-    champion_value: float,
-    challenger_value: float,
-    higher_is_better: bool,
-) -> float | None:
-    """Calculate normalized challenger improvement.
-
-    Positive:
-        Challenger improved.
-
-    Negative:
-        Challenger deteriorated.
-
-    Example for lower-is-better metric:
-
-        Champion MAE = 0.10
-        Challenger MAE = 0.08
-
-        Improvement = +0.20
-    """
-
-    if champion_value is None:
-        return None
-
-    if challenger_value is None:
-        return None
-
-    if not np.isfinite(champion_value):
-        return None
-
-    if not np.isfinite(challenger_value):
-        return None
-
-    denominator = abs(
-        champion_value
+    # Return MAE
+    predicted_return_column = first_existing_column(
+        frame,
+        [
+            "predicted_return",
+            "expected_return",
+        ],
     )
 
-    if denominator < 1e-12:
+    actual_return_column = first_existing_column(
+        frame,
+        [
+            "actual_return",
+            "realized_return",
+        ],
+    )
 
-        if higher_is_better:
-            return challenger_value - champion_value
+    predicted_return = numeric_series(
+        frame,
+        predicted_return_column,
+    )
 
-        return champion_value - challenger_value
+    actual_return = numeric_series(
+        frame,
+        actual_return_column,
+    )
 
-    if higher_is_better:
+    valid_return = (
+        predicted_return.notna()
+        & actual_return.notna()
+    )
 
-        return (
-            challenger_value
-            - champion_value
-        ) / denominator
+    return_mae = None
 
-    return (
-        champion_value
-        - challenger_value
-    ) / denominator
-
-
-# ============================================================
-# METRIC CONFIGURATION
-# ============================================================
-
-def get_active_metrics(
-    settings: dict[str, Any],
-) -> list[tuple[str, bool]]:
-    """Return enabled metrics.
-
-    Tuple format:
-
-        (
-            metric_name,
-            higher_is_better,
+    if valid_return.any():
+        return_mae = float(
+            np.mean(
+                np.abs(
+                    predicted_return[valid_return]
+                    - actual_return[valid_return]
+                )
+            )
         )
+
+    # Direction Accuracy
+    predicted_direction_column = first_existing_column(
+        frame,
+        [
+            "predicted_direction",
+            "direction",
+        ],
+    )
+
+    actual_direction_column = first_existing_column(
+        frame,
+        [
+            "actual_direction",
+        ],
+    )
+
+    direction_accuracy = None
+
+    if (
+        predicted_direction_column is not None
+        and actual_direction_column is not None
+    ):
+        predicted_direction = (
+            frame[predicted_direction_column]
+            .astype(str)
+            .str.upper()
+        )
+
+        actual_direction = (
+            frame[actual_direction_column]
+            .astype(str)
+            .str.upper()
+        )
+
+        direction_map = {
+            "1": "UP",
+            "1.0": "UP",
+            "TRUE": "UP",
+            "-1": "DOWN",
+            "-1.0": "DOWN",
+            "FALSE": "DOWN",
+        }
+
+        predicted_direction = predicted_direction.replace(
+            direction_map
+        )
+
+        actual_direction = actual_direction.replace(
+            direction_map
+        )
+
+        valid_direction = (
+            predicted_direction.isin(["UP", "DOWN"])
+            & actual_direction.isin(["UP", "DOWN"])
+        )
+
+        if valid_direction.any():
+            direction_accuracy = float(
+                (
+                    predicted_direction[valid_direction]
+                    == actual_direction[valid_direction]
+                ).mean()
+            )
+
+    # Brier Score
+    probability_column = first_existing_column(
+        frame,
+        [
+            "direction_probability",
+            "probability_up",
+            "confidence",
+        ],
+    )
+
+    brier_score = None
+
+    if (
+        probability_column is not None
+        and actual_direction_column is not None
+    ):
+        probability = numeric_series(
+            frame,
+            probability_column,
+        )
+
+        actual_direction = (
+            frame[actual_direction_column]
+            .astype(str)
+            .str.upper()
+        )
+
+        actual_binary = actual_direction.map(
+            {
+                "UP": 1.0,
+                "DOWN": 0.0,
+                "1": 1.0,
+                "1.0": 1.0,
+                "-1": 0.0,
+                "-1.0": 0.0,
+            }
+        )
+
+        valid_probability = (
+            probability.notna()
+            & actual_binary.notna()
+        )
+
+        if valid_probability.any():
+            probability = probability.clip(0.0, 1.0)
+
+            brier_score = float(
+                np.mean(
+                    (
+                        probability[valid_probability]
+                        - actual_binary[valid_probability]
+                    ) ** 2
+                )
+            )
+
+    # Risk MAE
+    predicted_risk_column = first_existing_column(
+        frame,
+        [
+            "predicted_risk",
+            "expected_risk",
+        ],
+    )
+
+    actual_risk_column = first_existing_column(
+        frame,
+        [
+            "actual_risk",
+            "realized_risk",
+        ],
+    )
+
+    predicted_risk = numeric_series(
+        frame,
+        predicted_risk_column,
+    )
+
+    actual_risk = numeric_series(
+        frame,
+        actual_risk_column,
+    )
+
+    valid_risk = (
+        predicted_risk.notna()
+        & actual_risk.notna()
+    )
+
+    risk_mae = None
+
+    if valid_risk.any():
+        risk_mae = float(
+            np.mean(
+                np.abs(
+                    predicted_risk[valid_risk]
+                    - actual_risk[valid_risk]
+                )
+            )
+        )
+
+    return ModelMetrics(
+        model_name=str(model_name),
+        sample_count=sample_count,
+        return_mae=return_mae,
+        direction_accuracy=direction_accuracy,
+        brier_score=brier_score,
+        risk_mae=risk_mae,
+    )
+
+
+# ============================================================
+# COMMON COMPARISON DATA
+# ============================================================
+
+def get_comparable_predictions(
+    predictions: pd.DataFrame,
+    champion_name: str,
+    challenger_name: str,
+    comparison_window: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Restrict comparison to the most recent evaluated predictions.
+
+    If symbol/date keys exist for both models, only common prediction
+    opportunities are compared.
     """
 
-    metrics: list[
-        tuple[str, bool]
-    ] = []
+    champion = predictions[
+        predictions["model_name"]
+        .astype(str)
+        .eq(str(champion_name))
+    ].copy()
 
-    if settings.get(
-        "evaluate_return_mae",
-        True,
-    ):
+    challenger = predictions[
+        predictions["model_name"]
+        .astype(str)
+        .eq(str(challenger_name))
+    ].copy()
 
-        metrics.append(
-            (
-                "return_mae",
-                False,
-            )
+    if champion.empty or challenger.empty:
+        return champion, challenger
+
+    date_column = first_existing_column(
+        predictions,
+        [
+            "prediction_date",
+            "market_date",
+            "date",
+        ],
+    )
+
+    symbol_column = first_existing_column(
+        predictions,
+        [
+            "symbol",
+            "ticker",
+        ],
+    )
+
+    key_columns = [
+        column
+        for column in [date_column, symbol_column]
+        if column is not None
+    ]
+
+    if key_columns:
+        champion_keys = champion[key_columns].drop_duplicates()
+        challenger_keys = challenger[key_columns].drop_duplicates()
+
+        common_keys = champion_keys.merge(
+            challenger_keys,
+            on=key_columns,
+            how="inner",
         )
 
-    if settings.get(
-        "evaluate_direction_accuracy",
-        True,
-    ):
-
-        metrics.append(
-            (
-                "direction_accuracy",
-                True,
-            )
+        champion = champion.merge(
+            common_keys,
+            on=key_columns,
+            how="inner",
         )
 
-    if settings.get(
-        "evaluate_brier_score",
-        True,
-    ):
-
-        metrics.append(
-            (
-                "brier_score",
-                False,
-            )
+        challenger = challenger.merge(
+            common_keys,
+            on=key_columns,
+            how="inner",
         )
 
-    if settings.get(
-        "evaluate_risk_mae",
-        True,
-    ):
+    if date_column is not None:
+        champion = champion.sort_values(
+            date_column
+        ).tail(comparison_window)
 
-        metrics.append(
-            (
-                "risk_mae",
-                False,
-            )
-        )
+        challenger = challenger.sort_values(
+            date_column
+        ).tail(comparison_window)
 
-    return metrics
+    else:
+        champion = champion.tail(comparison_window)
+        challenger = challenger.tail(comparison_window)
+
+    return champion.reset_index(drop=True), challenger.reset_index(drop=True)
 
 
 # ============================================================
-# COMPARISON
+# IMPROVEMENT SCORING
 # ============================================================
 
-def compare_models(
-    ledger: pd.DataFrame,
+def calculate_improvement_score(
+    champion: ModelMetrics,
+    challenger: ModelMetrics,
+    config: dict[str, Any],
+) -> tuple[float, list[str]]:
+    """
+    Calculate average normalized Challenger improvement.
+
+    Positive score = Challenger better.
+    Negative score = Champion better.
+    """
+
+    improvements: list[float] = []
+    reasons: list[str] = []
+
+    if (
+        config.get("evaluate_return_mae", True)
+        and champion.return_mae is not None
+        and challenger.return_mae is not None
+    ):
+        baseline = max(abs(champion.return_mae), 1e-12)
+
+        improvement = (
+            champion.return_mae
+            - challenger.return_mae
+        ) / baseline
+
+        improvements.append(improvement)
+
+        reasons.append(
+            "Return MAE improvement: "
+            f"{improvement:.2%}"
+        )
+
+    if (
+        config.get("evaluate_direction_accuracy", True)
+        and champion.direction_accuracy is not None
+        and challenger.direction_accuracy is not None
+    ):
+        baseline = max(
+            abs(champion.direction_accuracy),
+            1e-12,
+        )
+
+        improvement = (
+            challenger.direction_accuracy
+            - champion.direction_accuracy
+        ) / baseline
+
+        improvements.append(improvement)
+
+        reasons.append(
+            "Direction accuracy improvement: "
+            f"{improvement:.2%}"
+        )
+
+    if (
+        config.get("evaluate_brier_score", True)
+        and champion.brier_score is not None
+        and challenger.brier_score is not None
+    ):
+        baseline = max(
+            abs(champion.brier_score),
+            1e-12,
+        )
+
+        improvement = (
+            champion.brier_score
+            - challenger.brier_score
+        ) / baseline
+
+        improvements.append(improvement)
+
+        reasons.append(
+            "Brier score improvement: "
+            f"{improvement:.2%}"
+        )
+
+    if (
+        config.get("evaluate_risk_mae", True)
+        and champion.risk_mae is not None
+        and challenger.risk_mae is not None
+    ):
+        baseline = max(
+            abs(champion.risk_mae),
+            1e-12,
+        )
+
+        improvement = (
+            champion.risk_mae
+            - challenger.risk_mae
+        ) / baseline
+
+        improvements.append(improvement)
+
+        reasons.append(
+            "Risk MAE improvement: "
+            f"{improvement:.2%}"
+        )
+
+    if not improvements:
+        return (
+            0.0,
+            ["No comparable metrics available."],
+        )
+
+    score = float(np.mean(improvements))
+
+    return score, reasons
+
+
+# ============================================================
+# PROMOTION DECISION
+# ============================================================
+
+def evaluate_challenger(
+    predictions: pd.DataFrame,
+    champion_name: str,
+    challenger_name: str,
     config: dict[str, Any] | None = None,
-) -> ComparisonResult:
-    """Compare Champion and Challenger performance."""
+) -> tuple[
+    ModelMetrics,
+    ModelMetrics,
+    PromotionDecision,
+]:
+    """Evaluate one Challenger against the Champion."""
 
-    settings = DEFAULT_CONFIG.copy()
+    settings = load_champion_challenger_config()
 
     if config:
         settings.update(config)
 
-    champion_name = str(
-        settings["champion"]
-    )
-
-    challenger_name = str(
-        settings["challenger"]
+    comparison_window = int(
+        settings.get("comparison_window", 50)
     )
 
     minimum_evaluations = int(
-        settings["minimum_evaluations"]
-    )
-
-    comparison_window = int(
-        settings["comparison_window"]
+        settings.get("minimum_evaluations", 30)
     )
 
     minimum_improvement = float(
-        settings["minimum_improvement"]
+        settings.get("minimum_improvement", 0.02)
     )
 
-    # --------------------------------------------------------
-    # FILTER MODEL RECORDS
-    # --------------------------------------------------------
-
-    champion_records = (
-        filter_model_records(
-            ledger=ledger,
-            model_name=champion_name,
-        )
-    )
-
-    challenger_records = (
-        filter_model_records(
-            ledger=ledger,
-            model_name=challenger_name,
-        )
-    )
-
-    # --------------------------------------------------------
-    # LIMIT COMPARISON WINDOW
-    # --------------------------------------------------------
-
-    if len(
-        champion_records
-    ) > comparison_window:
-
-        champion_records = (
-            champion_records.iloc[
-                -comparison_window:
-            ].copy()
-        )
-
-    if len(
-        challenger_records
-    ) > comparison_window:
-
-        challenger_records = (
-            challenger_records.iloc[
-                -comparison_window:
-            ].copy()
-        )
-
-    champion_count = len(
-        champion_records
-    )
-
-    challenger_count = len(
-        challenger_records
-    )
-
-    # --------------------------------------------------------
-    # CHECK DATA
-    # --------------------------------------------------------
-
-    if (
-        champion_count
-        < minimum_evaluations
-        or challenger_count
-        < minimum_evaluations
-    ):
-
-        reasons = []
-
-        if (
-            champion_count
-            < minimum_evaluations
-        ):
-
-            reasons.append(
-                "Champion has insufficient "
-                f"evaluations: {champion_count} "
-                f"available, "
-                f"{minimum_evaluations} required."
-            )
-
-        if (
-            challenger_count
-            < minimum_evaluations
-        ):
-
-            reasons.append(
-                "Challenger has insufficient "
-                f"evaluations: {challenger_count} "
-                f"available, "
-                f"{minimum_evaluations} required."
-            )
-
-        return ComparisonResult(
-
+    champion_frame, challenger_frame = (
+        get_comparable_predictions(
+            predictions=predictions,
             champion_name=champion_name,
-
             challenger_name=challenger_name,
-
-            champion_records=champion_count,
-
-            challenger_records=challenger_count,
-
             comparison_window=comparison_window,
-
-            champion_metrics={},
-
-            challenger_metrics={},
-
-            metric_improvements={},
-
-            champion_score=0.0,
-
-            challenger_score=0.0,
-
-            overall_improvement=0.0,
-
-            winner="INSUFFICIENT_DATA",
-
-            promotion_recommended=False,
-
-            auto_promoted=False,
-
-            reasons=reasons,
-
-            recommendation=(
-                "Continue collecting evaluated "
-                "predictions before comparing models."
-            ),
-        )
-
-    # --------------------------------------------------------
-    # CALCULATE METRICS
-    # --------------------------------------------------------
-
-    champion_metrics = (
-        calculate_metrics(
-            champion_records
         )
     )
 
-    challenger_metrics = (
-        calculate_metrics(
-            challenger_records
+    champion_metrics = calculate_model_metrics(
+        champion_frame,
+        champion_name,
+    )
+
+    challenger_metrics = calculate_model_metrics(
+        challenger_frame,
+        challenger_name,
+    )
+
+    sample_count = min(
+        champion_metrics.sample_count,
+        challenger_metrics.sample_count,
+    )
+
+    improvement_score, reasons = (
+        calculate_improvement_score(
+            champion=champion_metrics,
+            challenger=challenger_metrics,
+            config=settings,
         )
     )
 
-    active_metrics = (
-        get_active_metrics(
-            settings
+    eligible = sample_count >= minimum_evaluations
+
+    if not eligible:
+        reasons.append(
+            "Insufficient evaluations: "
+            f"{sample_count}/{minimum_evaluations}"
         )
+
+    better_than_champion = (
+        improvement_score >= minimum_improvement
     )
 
-    metric_improvements: dict[
-        str,
-        float
-    ] = {}
-
-    valid_improvements: list[
-        float
-    ] = []
-
-    reasons: list[
-        str
-    ] = []
-
-    champion_score_components: list[
-        float
-    ] = []
-
-    challenger_score_components: list[
-        float
-    ] = []
-
-    # --------------------------------------------------------
-    # COMPARE EACH METRIC
-    # --------------------------------------------------------
-
-    for (
-        metric,
-        higher_is_better,
-    ) in active_metrics:
-
-        champion_value = (
-            champion_metrics.get(
-                metric
-            )
+    if better_than_champion:
+        reasons.append(
+            "Challenger exceeds minimum "
+            f"improvement of {minimum_improvement:.2%}."
         )
-
-        challenger_value = (
-            challenger_metrics.get(
-                metric
-            )
-        )
-
-        if (
-            champion_value is None
-            or challenger_value is None
-        ):
-
-            reasons.append(
-                f"Metric unavailable: {metric}."
-            )
-
-            continue
-
-        improvement = (
-            calculate_improvement(
-
-                champion_value,
-
-                challenger_value,
-
-                higher_is_better,
-            )
-        )
-
-        if improvement is None:
-            continue
-
-        metric_improvements[
-            metric
-        ] = float(
-            improvement
-        )
-
-        valid_improvements.append(
-            float(
-                improvement
-            )
-        )
-
-        if higher_is_better:
-
-            champion_score_components.append(
-                champion_value
-            )
-
-            challenger_score_components.append(
-                challenger_value
-            )
-
-        else:
-
-            # Invert error metrics so
-            # lower error produces a
-            # larger internal score.
-
-            champion_score_components.append(
-                1.0
-                / (
-                    1.0
-                    + abs(champion_value)
-                )
-            )
-
-            challenger_score_components.append(
-                1.0
-                / (
-                    1.0
-                    + abs(challenger_value)
-                )
-            )
-
-        if improvement > 0:
-
-            reasons.append(
-                f"Challenger improved "
-                f"{metric} by "
-                f"{improvement:.2%}."
-            )
-
-        elif improvement < 0:
-
-            reasons.append(
-                f"Challenger deteriorated "
-                f"{metric} by "
-                f"{abs(improvement):.2%}."
-            )
-
-        else:
-
-            reasons.append(
-                f"No change in {metric}."
-            )
-
-    # --------------------------------------------------------
-    # OVERALL SCORES
-    # --------------------------------------------------------
-
-    if champion_score_components:
-
-        champion_score = float(
-            np.mean(
-                champion_score_components
-            )
-        )
-
     else:
+        reasons.append(
+            "Challenger does not exceed minimum "
+            f"improvement of {minimum_improvement:.2%}."
+        )
 
-        champion_score = 0.0
+    decision = PromotionDecision(
+        challenger_name=str(challenger_name),
+        champion_name=str(champion_name),
+        eligible=eligible,
+        better_than_champion=better_than_champion,
+        improvement_score=improvement_score,
+        minimum_improvement=minimum_improvement,
+        sample_count=sample_count,
+        reasons=reasons,
+        promoted=False,
+    )
 
-    if challenger_score_components:
+    return (
+        champion_metrics,
+        challenger_metrics,
+        decision,
+    )
 
-        challenger_score = float(
-            np.mean(
-                challenger_score_components
+
+# ============================================================
+# PROMOTION
+# ============================================================
+
+def promote_challenger(
+    challenger_name: str,
+    registry_path: str | Path = "data/model_registry.json",
+    decision: PromotionDecision | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    """
+    Promote a Challenger to Champion.
+
+    Unless force=True, a positive eligible promotion decision
+    is required.
+    """
+
+    if not force:
+        if decision is None:
+            raise ValueError(
+                "Promotion decision is required."
             )
-        )
 
-    else:
-
-        challenger_score = 0.0
-
-    if valid_improvements:
-
-        overall_improvement = float(
-            np.mean(
-                valid_improvements
+        if not decision.eligible:
+            raise ValueError(
+                "Challenger is not eligible for promotion."
             )
-        )
 
-    else:
+        if not decision.better_than_champion:
+            raise ValueError(
+                "Challenger did not outperform Champion."
+            )
 
-        overall_improvement = 0.0
+    registry = load_model_registry(registry_path)
 
-    # --------------------------------------------------------
-    # DECIDE WINNER
-    # --------------------------------------------------------
+    current_champion = registry.get("champion")
 
-    if not valid_improvements:
+    challenger_index = None
+    challenger_entry = None
 
-        winner = "NO_COMPARISON"
-
-        promotion_recommended = False
-
-        recommendation = (
-            "No compatible metrics were available "
-            "for model comparison."
-        )
-
-    elif (
-        overall_improvement
-        >= minimum_improvement
+    for index, entry in enumerate(
+        registry.get("challengers", [])
     ):
+        if (
+            str(entry.get("model_name"))
+            == str(challenger_name)
+        ):
+            challenger_index = index
+            challenger_entry = entry
+            break
 
-        winner = "CHALLENGER"
-
-        promotion_recommended = True
-
-        recommendation = (
-            "Challenger outperformed the champion "
-            f"by {overall_improvement:.2%}. "
-            "Promotion is recommended."
+    if challenger_entry is None:
+        raise ValueError(
+            f"Challenger not found: {challenger_name}"
         )
 
-    elif overall_improvement > 0:
+    timestamp = datetime.now(
+        timezone.utc
+    ).isoformat()
 
-        winner = "CHALLENGER_SLIGHTLY"
+    new_champion = dict(challenger_entry)
 
-        promotion_recommended = False
+    new_champion["status"] = "CHAMPION"
+    new_champion["promoted_at"] = timestamp
 
-        recommendation = (
-            "Challenger performed slightly better, "
-            "but did not meet the configured "
-            "minimum improvement threshold."
+    registry["champion"] = new_champion
+
+    registry["challengers"].pop(
+        challenger_index
+    )
+
+    if current_champion:
+        previous = dict(current_champion)
+
+        previous["status"] = "RETIRED"
+        previous["retired_at"] = timestamp
+
+        registry.setdefault(
+            "history",
+            [],
+        ).append(previous)
+
+    registry.setdefault(
+        "history",
+        [],
+    ).append(
+        {
+            "event": "PROMOTION",
+            "timestamp": timestamp,
+            "from": (
+                current_champion.get("model_name")
+                if isinstance(
+                    current_champion,
+                    dict,
+                )
+                else current_champion
+            ),
+            "to": challenger_name,
+            "decision": (
+                decision.to_dict()
+                if decision is not None
+                else None
+            ),
+        }
+    )
+
+    save_model_registry(
+        registry,
+        registry_path,
+    )
+
+    logger.warning(
+        "CHALLENGER PROMOTED: %s -> CHAMPION",
+        challenger_name,
+    )
+
+    return registry
+
+
+# ============================================================
+# FULL COMPARISON
+# ============================================================
+
+def compare_all_challengers(
+    ledger_path: str | Path = "data/ledger/predictions.csv",
+    registry_path: str | Path = "data/model_registry.json",
+    config: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Evaluate every active Challenger against the current Champion.
+    """
+
+    settings = load_champion_challenger_config()
+
+    if config:
+        settings.update(config)
+
+    if not bool(settings.get("enabled", True)):
+        logger.info(
+            "Champion/Challenger evaluation disabled."
         )
+        return []
 
-    elif overall_improvement < 0:
+    predictions = load_evaluated_predictions(
+        ledger_path
+    )
 
-        winner = "CHAMPION"
-
-        promotion_recommended = False
-
-        recommendation = (
-            "Champion remains superior. "
-            "Do not promote the challenger."
+    if predictions.empty:
+        logger.info(
+            "No evaluated predictions available."
         )
+        return []
 
+    registry = load_model_registry(
+        registry_path
+    )
+
+    champion_entry = registry.get("champion")
+
+    if isinstance(champion_entry, dict):
+        champion_name = str(
+            champion_entry.get(
+                "model_name",
+                settings.get("champion", "current"),
+            )
+        )
     else:
-
-        winner = "TIE"
-
-        promotion_recommended = False
-
-        recommendation = (
-            "Both models performed similarly. "
-            "Continue collecting evaluations."
+        champion_name = str(
+            champion_entry
+            or settings.get("champion", "current")
         )
 
-    # --------------------------------------------------------
-    # AUTO PROMOTION
-    # --------------------------------------------------------
+    results: list[dict[str, Any]] = []
 
-    auto_promoted = False
+    for challenger in registry.get(
+        "challengers",
+        [],
+    ):
+        status = str(
+            challenger.get(
+                "status",
+                "CHALLENGER",
+            )
+        ).upper()
+
+        if status not in {
+            "CHALLENGER",
+            "ACTIVE",
+            "EVALUATING",
+        }:
+            continue
+
+        challenger_name = challenger.get(
+            "model_name"
+        )
+
+        if not challenger_name:
+            continue
+
+        champion_metrics, challenger_metrics, decision = (
+            evaluate_challenger(
+                predictions=predictions,
+                champion_name=champion_name,
+                challenger_name=str(challenger_name),
+                config=settings,
+            )
+        )
+
+        result = {
+            "champion_metrics": (
+                champion_metrics.to_dict()
+            ),
+            "challenger_metrics": (
+                challenger_metrics.to_dict()
+            ),
+            "decision": (
+                decision.to_dict()
+            ),
+        }
+
+        results.append(result)
+
+        logger.info(
+            "Comparison | Champion=%s Challenger=%s "
+            "Eligible=%s Better=%s Improvement=%.2f%%",
+            champion_name,
+            challenger_name,
+            decision.eligible,
+            decision.better_than_champion,
+            decision.improvement_score * 100,
+        )
+
+    return results
+
+
+# ============================================================
+# AUTO PROMOTION
+# ============================================================
+
+def evaluate_and_maybe_promote(
+    ledger_path: str | Path = "data/ledger/predictions.csv",
+    registry_path: str | Path = "data/model_registry.json",
+    config: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Compare Challengers and optionally promote them.
+
+    Promotion obeys:
+        auto_promote
+        require_manual_approval
+    """
+
+    settings = load_champion_challenger_config()
+
+    if config:
+        settings.update(config)
+
+    results = compare_all_challengers(
+        ledger_path=ledger_path,
+        registry_path=registry_path,
+        config=settings,
+    )
+
+    auto_promote = bool(
+        settings.get("auto_promote", False)
+    )
+
+    require_manual_approval = bool(
+        settings.get(
+            "require_manual_approval",
+            True,
+        )
+    )
 
     if (
-        promotion_recommended
-        and bool(
-            settings.get(
-                "auto_promote",
-                False,
-            )
-        )
-        and not bool(
-            settings.get(
-                "require_manual_approval",
-                True,
-            )
-        )
+        not auto_promote
+        or require_manual_approval
     ):
+        return results
 
-        auto_promoted = True
+    for result in results:
+        decision_data = result["decision"]
 
-        recommendation = (
-            "Challenger meets the promotion "
-            "criteria and is eligible for "
-            "automatic promotion."
+        if not (
+            decision_data["eligible"]
+            and decision_data["better_than_champion"]
+        ):
+            continue
+
+        decision = PromotionDecision(
+            **decision_data
         )
 
-    return ComparisonResult(
+        promote_challenger(
+            challenger_name=decision.challenger_name,
+            registry_path=registry_path,
+            decision=decision,
+        )
 
-        champion_name=champion_name,
+        decision.promoted = True
+        result["decision"] = decision.to_dict()
 
-        challenger_name=challenger_name,
-
-        champion_records=champion_count,
-
-        challenger_records=challenger_count,
-
-        comparison_window=comparison_window,
-
-        champion_metrics=champion_metrics,
-
-        challenger_metrics=challenger_metrics,
-
-        metric_improvements=metric_improvements,
-
-        champion_score=round(
-            champion_score,
-            6,
-        ),
-
-        challenger_score=round(
-            challenger_score,
-            6,
-        ),
-
-        overall_improvement=round(
-            overall_improvement,
-            6,
-        ),
-
-        winner=winner,
-
-        promotion_recommended=(
-            promotion_recommended
-        ),
-
-        auto_promoted=auto_promoted,
-
-        reasons=reasons,
-
-        recommendation=recommendation,
-    )
+    return results
 
 
 # ============================================================
-# CONVENIENCE FUNCTION
+# CLI
 # ============================================================
 
-def analyze_champion_challenger(
-    ledger: pd.DataFrame,
-    config: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Compare models and return a dictionary."""
+if __name__ == "__main__":
 
-    result = compare_models(
-        ledger=ledger,
-        config=config,
+    logging.basicConfig(
+        level=logging.INFO,
+        format=(
+            "%(asctime)s | "
+            "%(levelname)s | "
+            "%(name)s | "
+            "%(message)s"
+        ),
     )
 
-    return result.to_dict()
+    results = evaluate_and_maybe_promote()
+
+    print(
+        json.dumps(
+            results,
+            indent=2,
+            default=str,
+        )
+    )
