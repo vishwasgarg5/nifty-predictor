@@ -1,16 +1,21 @@
 # src/ipo_gmp.py
 """
-IPO Desk + GMP helper.
+Dynamic IPO Desk: GMP + subscription status (best-effort).
 
-- Tries a static HTML scrape (best-effort; many GMP sites are JS-only).
-- Falls back to previous CSV, then to a seed list so Telegram is never empty.
-- GMP is unofficial grey-market data — not investment advice.
+Sources (in order):
+  1) IPOGuru API  (if IPOGURU_API_KEY set) — clean JSON
+  2) Static HTML tables (ipowatch / others) via pd.read_html(StringIO)
+  3) Previous CSV
+  4) Seed list
+
+GMP is unofficial grey-market data — not investment advice.
 """
 
 from __future__ import annotations
 
 import io
 import logging
+import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -36,8 +41,23 @@ COLS = [
     "GMP",
     "LotSize",
     "Status",
+    "SubTotal",
+    "SubQIB",
+    "SubNII",
+    "SubRetail",
+    "Source",
     "UpdatedAt",
 ]
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-IN,en;q=0.9",
+}
 
 
 def _empty() -> pd.DataFrame:
@@ -51,7 +71,11 @@ def load_ipo_pipeline() -> pd.DataFrame:
         df.to_csv(PIPELINE, index=False)
         return df
     try:
-        return pd.read_csv(PIPELINE)
+        df = pd.read_csv(PIPELINE)
+        for c in COLS:
+            if c not in df.columns:
+                df[c] = ""
+        return df
     except Exception as e:
         logger.warning(f"ipo_pipeline read failed: {e}")
         return _empty()
@@ -67,31 +91,221 @@ def _verdict(gmp_pct: float) -> str:
 
 def _to_float(x, default: float = 0.0) -> float:
     try:
-        s = str(x).replace(",", "").replace("₹", "").replace("%", "").strip()
+        s = str(x).replace(",", "").replace("₹", "").replace("%", "").replace("x", "").strip()
         m = re.search(r"-?\d+(?:\.\d+)?", s)
         return float(m.group()) if m else default
     except Exception:
         return default
 
 
+def _now() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+def _norm_name(s: str) -> str:
+    return re.sub(r"\s+", " ", str(s).lower().replace("ipo", "")).strip()[:40]
+
+
+# ---------------------------------------------------------------------------
+# Source 1: IPOGuru API (optional key)
+# ---------------------------------------------------------------------------
+def _from_ipoguru() -> pd.DataFrame:
+    key = os.getenv("IPOGURU_API_KEY", "").strip()
+    if not key:
+        return _empty()
+
+    base = "https://www.ipoguru.in/api/v1"
+    session = requests.Session()
+    session.headers.update({**HEADERS, "X-API-Key": key, "Authorization": f"Bearer {key}"})
+
+    rows = []
+    for status in ("open", "upcoming"):
+        try:
+            r = session.get(
+                f"{base}/ipos",
+                params={"status": status},
+                timeout=20,
+            )
+            if r.status_code != 200:
+                logger.warning(f"IPOGuru {status}: HTTP {r.status_code}")
+                continue
+            payload = r.json()
+            items = payload.get("data") or payload.get("ipos") or []
+            if isinstance(payload, list):
+                items = payload
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                name = str(it.get("name") or it.get("company") or "").strip()
+                if not name:
+                    continue
+                band = str(it.get("price_band") or it.get("priceBand") or "")
+                parts = re.findall(r"\d+(?:\.\d+)?", band.replace(",", ""))
+                low = float(parts[0]) if parts else _to_float(it.get("issue_price"), 0)
+                high = float(parts[-1]) if parts else low
+                gmp = _to_float(it.get("gmp") or it.get("gmp_price") or it.get("grey_market_premium"), 0)
+                sub = it.get("subscription") or it.get("sub") or {}
+                if not isinstance(sub, dict):
+                    sub = {}
+                rows.append(
+                    {
+                        "Name": name[:60],
+                        "Symbol": str(it.get("symbol") or ""),
+                        "OpenDate": str(it.get("open_date") or it.get("startDate") or "")[:12],
+                        "CloseDate": str(it.get("close_date") or it.get("endDate") or "")[:12],
+                        "PriceLow": low,
+                        "PriceHigh": high,
+                        "GMP": gmp,
+                        "LotSize": _to_float(it.get("lot_size") or it.get("minQty"), 0),
+                        "Status": status,
+                        "SubTotal": _to_float(sub.get("total") or it.get("subscription_total"), 0),
+                        "SubQIB": _to_float(sub.get("qib") or it.get("qib"), 0),
+                        "SubNII": _to_float(sub.get("nii") or it.get("nii"), 0),
+                        "SubRetail": _to_float(sub.get("retail") or it.get("rii") or it.get("retail"), 0),
+                        "Source": "ipoguru",
+                        "UpdatedAt": _now(),
+                    }
+                )
+        except Exception as e:
+            logger.warning(f"IPOGuru failed ({status}): {e}")
+
+    if rows:
+        logger.info(f"IPOGuru: {len(rows)} rows")
+        return pd.DataFrame(rows)
+    return _empty()
+
+
+# ---------------------------------------------------------------------------
+# Source 2: static HTML tables
+# ---------------------------------------------------------------------------
+def _parse_tables(html: str, source: str) -> list[dict]:
+    try:
+        tables = pd.read_html(io.StringIO(html))
+    except Exception as e:
+        logger.debug(f"read_html failed ({source}): {e}")
+        return []
+
+    rows = []
+    for t in tables:
+        cols_l = [str(c).lower() for c in t.columns]
+        name_col = next(
+            (c for c in t.columns if any(k in str(c).lower() for k in ("name", "company", "ipo"))),
+            None,
+        )
+        if name_col is None:
+            continue
+
+        gmp_col = next((c for c in t.columns if "gmp" in str(c).lower()), None)
+        price_col = next(
+            (c for c in t.columns if "price" in str(c).lower() or "band" in str(c).lower()),
+            None,
+        )
+        open_col = next((c for c in t.columns if str(c).lower().startswith("open")), None)
+        close_col = next((c for c in t.columns if "close" in str(c).lower()), None)
+        lot_col = next((c for c in t.columns if "lot" in str(c).lower()), None)
+        sub_col = next(
+            (c for c in t.columns if "sub" in str(c).lower() or "subscription" in str(c).lower()),
+            None,
+        )
+        qib_col = next((c for c in t.columns if "qib" in str(c).lower()), None)
+        nii_col = next((c for c in t.columns if "nii" in str(c).lower() or "hni" in str(c).lower()), None)
+        rii_col = next(
+            (c for c in t.columns if "retail" in str(c).lower() or "rii" in str(c).lower()),
+            None,
+        )
+        status_col = next((c for c in t.columns if "status" in str(c).lower()), None)
+
+        for _, row in t.iterrows():
+            name = str(row[name_col]).strip()
+            if not name or name.lower() in ("nan", "name", "ipo", "company"):
+                continue
+
+            low, high = "", 0.0
+            if price_col is not None:
+                parts = re.findall(r"\d+(?:\.\d+)?", str(row[price_col]).replace(",", ""))
+                if len(parts) >= 2:
+                    low, high = float(parts[0]), float(parts[-1])
+                elif parts:
+                    high = float(parts[0])
+
+            st = "open"
+            if status_col is not None:
+                raw = str(row[status_col]).lower()
+                if "upcom" in raw or "soon" in raw:
+                    st = "upcoming"
+                elif "close" in raw or "list" in raw:
+                    st = "closed"
+
+            rows.append(
+                {
+                    "Name": name[:60],
+                    "Symbol": "",
+                    "OpenDate": str(row[open_col])[:12] if open_col is not None else "",
+                    "CloseDate": str(row[close_col])[:12] if close_col is not None else "",
+                    "PriceLow": low,
+                    "PriceHigh": high if high else "",
+                    "GMP": _to_float(row[gmp_col], 0) if gmp_col is not None else 0.0,
+                    "LotSize": _to_float(row[lot_col], 0) if lot_col is not None else "",
+                    "Status": st,
+                    "SubTotal": _to_float(row[sub_col], 0) if sub_col is not None else 0.0,
+                    "SubQIB": _to_float(row[qib_col], 0) if qib_col is not None else 0.0,
+                    "SubNII": _to_float(row[nii_col], 0) if nii_col is not None else 0.0,
+                    "SubRetail": _to_float(row[rii_col], 0) if rii_col is not None else 0.0,
+                    "Source": source,
+                    "UpdatedAt": _now(),
+                }
+            )
+    return rows
+
+
+def _from_html_sources() -> pd.DataFrame:
+    urls = [
+        ("ipowatch", "https://ipowatch.in/ipo-grey-market-premium-latest-ipo-gmp/"),
+        ("ipowatch_home", "https://ipowatch.in/"),
+        ("chanakya", "https://chanakyanipothi.com/ipo-gmp-today/"),
+    ]
+    all_rows = []
+    for name, url in urls:
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=25, allow_redirects=True)
+            if r.status_code != 200:
+                logger.warning(f"{name}: HTTP {r.status_code}")
+                continue
+            parsed = _parse_tables(r.text, name)
+            if parsed:
+                logger.info(f"{name}: {len(parsed)} rows")
+                all_rows.extend(parsed)
+                break  # first good source wins
+            else:
+                logger.warning(f"{name}: no tables")
+        except Exception as e:
+            logger.warning(f"{name} scrape failed: {e}")
+
+    if not all_rows:
+        return _empty()
+
+    # de-dupe by name
+    df = pd.DataFrame(all_rows)
+    df["_k"] = df["Name"].map(_norm_name)
+    df = df.drop_duplicates(subset=["_k"], keep="first").drop(columns=["_k"])
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Seed fallback
+# ---------------------------------------------------------------------------
 def _seed_current_ipos() -> pd.DataFrame:
-    """
-    Fallback seed so IPO desk is never empty on GitHub Actions.
-    Update these rows when you want fresher approximate GMP.
-    Values are illustrative / approximate — not live exchange quotes.
-    """
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now = _now()
     rows = [
-        # Name, OpenDate, CloseDate, PriceLow, PriceHigh, GMP, LotSize, Status
-        ("Tempsens Instruments", "2026-08-20", "2026-08-24", 280, 300, 170, 50, "open"),
-        ("Augmont Enterprises", "2026-08-21", "2026-08-25", 750, 788, 180, 19, "open"),
-        ("Gaja Alternative AMC", "2026-08-19", "2026-08-21", 150, 160, 30, 93, "open"),
-        ("Skyways Air", "2026-08-24", "2026-08-27", 130, 138, 33, 100, "upcoming"),
-        ("Symbiotec Pharmalab", "2026-08-24", "2026-08-27", 950, 988, 320, 15, "upcoming"),
-        ("Hy-Tech Engineers", "2026-08-24", "2026-08-27", 50, 53, 22, 238, "upcoming"),
+        ("Tempsens Instruments", "2026-08-20", "2026-08-24", 280, 300, 170, 50, "open", 6.0, 10.0, 5.0, 3.0),
+        ("Augmont Enterprises", "2026-08-21", "2026-08-25", 750, 788, 180, 19, "open", 3.0, 5.0, 2.0, 1.5),
+        ("Gaja Alternative AMC", "2026-08-19", "2026-08-21", 150, 160, 30, 93, "open", 30.0, 40.0, 20.0, 10.0),
+        ("Skyways Air", "2026-08-24", "2026-08-27", 130, 138, 33, 100, "upcoming", 0, 0, 0, 0),
+        ("Symbiotec Pharmalab", "2026-08-24", "2026-08-27", 950, 988, 320, 15, "upcoming", 0, 0, 0, 0),
+        ("Hy-Tech Engineers", "2026-08-24", "2026-08-27", 50, 53, 22, 238, "upcoming", 0, 0, 0, 0),
     ]
     data = []
-    for name, o, c, lo, hi, gmp, lot, st in rows:
+    for name, o, c, lo, hi, gmp, lot, st, tot, qib, nii, rii in rows:
         data.append(
             {
                 "Name": name,
@@ -103,171 +317,97 @@ def _seed_current_ipos() -> pd.DataFrame:
                 "GMP": gmp,
                 "LotSize": lot,
                 "Status": st,
+                "SubTotal": tot,
+                "SubQIB": qib,
+                "SubNII": nii,
+                "SubRetail": rii,
+                "Source": "seed",
                 "UpdatedAt": now,
             }
         )
     return pd.DataFrame(data)
 
 
-def _try_scrape_static() -> pd.DataFrame:
-    """
-    Best-effort scrape. Most GMP sites are JS (Next.js) and return no tables.
-    Always use io.StringIO so pandas never treats HTML as a filepath.
-    """
-    urls = [
-        "https://www.investorgain.com/report/ipo-gmp-live/331/",
-        "https://www.investorgain.com/report/live-ipo-gmp/331/ipo/",
-    ]
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-
-    for url in urls:
-        try:
-            r = requests.get(url, headers=headers, timeout=25, allow_redirects=True)
-            r.raise_for_status()
-            # CRITICAL: StringIO prevents "No such file or directory: <!DOCTYPE..."
-            tables = pd.read_html(io.StringIO(r.text))
-        except Exception as e:
-            logger.warning(f"Static GMP scrape failed ({url}): {e}")
-            continue
-
-        rows = []
-        now = datetime.now().strftime("%Y-%m-%d %H:%M")
-        for t in tables:
-            name_col = next(
-                (
-                    c
-                    for c in t.columns
-                    if any(k in str(c).lower() for k in ("name", "ipo", "company"))
-                ),
-                None,
-            )
-            gmp_col = next(
-                (c for c in t.columns if "gmp" in str(c).lower()),
-                None,
-            )
-            price_col = next(
-                (c for c in t.columns if "price" in str(c).lower()),
-                None,
-            )
-            open_col = next(
-                (c for c in t.columns if str(c).lower().startswith("open")),
-                None,
-            )
-            close_col = next(
-                (c for c in t.columns if "close" in str(c).lower()),
-                None,
-            )
-            lot_col = next(
-                (c for c in t.columns if "lot" in str(c).lower()),
-                None,
-            )
-            if name_col is None:
-                continue
-
-            for _, row in t.iterrows():
-                name = str(row[name_col]).strip()
-                if not name or name.lower() in ("nan", "name", "ipo"):
-                    continue
-
-                gmp = _to_float(row[gmp_col], 0) if gmp_col is not None else 0.0
-                low, high = "", 0.0
-                if price_col is not None:
-                    raw_price = str(row[price_col])
-                    parts = re.findall(r"\d+(?:\.\d+)?", raw_price.replace(",", ""))
-                    if len(parts) >= 2:
-                        low, high = float(parts[0]), float(parts[-1])
-                    elif parts:
-                        high = float(parts[0])
-
-                rows.append(
-                    {
-                        "Name": name[:60],
-                        "Symbol": "",
-                        "OpenDate": str(row[open_col])[:12] if open_col is not None else "",
-                        "CloseDate": str(row[close_col])[:12] if close_col is not None else "",
-                        "PriceLow": low,
-                        "PriceHigh": high if high else "",
-                        "GMP": gmp,
-                        "LotSize": _to_float(row[lot_col], 0) if lot_col is not None else "",
-                        "Status": "open",
-                        "UpdatedAt": now,
-                    }
-                )
-
-        if rows:
-            logger.info(f"Parsed {len(rows)} IPO rows from {url}")
-            return pd.DataFrame(rows)
-
-    logger.warning("Static GMP scrape: no table rows found")
-    return _empty()
+def _merge_prefer_new(old: pd.DataFrame, new: pd.DataFrame) -> pd.DataFrame:
+    if old.empty:
+        return new
+    if new.empty:
+        return old
+    old = old.copy()
+    new = new.copy()
+    old["_k"] = old["Name"].map(_norm_name)
+    new["_k"] = new["Name"].map(_norm_name)
+    # new overwrites same name; keep old-only names
+    keys_new = set(new["_k"])
+    keep_old = old[~old["_k"].isin(keys_new)]
+    out = pd.concat([new, keep_old], ignore_index=True)
+    return out.drop(columns=["_k"], errors="ignore")
 
 
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 def refresh_ipo_gmp() -> dict:
-    """
-    Auto-update IPO pipeline:
-      1) try static scrape
-      2) keep previous CSV if present
-      3) seed defaults if nothing exists
-    """
     old = load_ipo_pipeline()
-    scraped = _try_scrape_static()
 
-    if scraped.empty:
-        if not old.empty and len(old) > 0:
-            logger.warning("GMP scrape empty — keeping previous pipeline")
+    # 1) API
+    df = _from_ipoguru()
+    source = "ipoguru"
+
+    # 2) HTML
+    if df.empty:
+        df = _from_html_sources()
+        source = "html"
+
+    if df.empty:
+        if not old.empty:
+            logger.warning("Dynamic GMP empty — keeping previous pipeline")
             return {"updated": 0, "kept": len(old), "source": "previous"}
-
-        seeded = _seed_current_ipos()
-        PIPELINE.parent.mkdir(parents=True, exist_ok=True)
-        seeded.to_csv(PIPELINE, index=False)
-        logger.info(f"IPO pipeline seeded: {len(seeded)} rows")
-        return {"updated": len(seeded), "kept": 0, "source": "seed"}
+        df = _seed_current_ipos()
+        source = "seed"
+        logger.info(f"IPO pipeline seeded: {len(df)} rows")
+    else:
+        df = _merge_prefer_new(old, df)
+        logger.info(f"IPO pipeline updated: {len(df)} rows ({source})")
 
     PIPELINE.parent.mkdir(parents=True, exist_ok=True)
-    scraped.to_csv(PIPELINE, index=False)
-    logger.info(f"IPO pipeline updated: {len(scraped)} rows (scrape)")
-    return {"updated": len(scraped), "kept": 0, "source": "scrape"}
+    # ensure columns
+    for c in COLS:
+        if c not in df.columns:
+            df[c] = ""
+    df[COLS].to_csv(PIPELINE, index=False)
+    return {"updated": len(df), "kept": 0, "source": source}
 
 
 def build_ipo_desk_message(max_rows: int = 10) -> str:
-    """Telegram-ready IPO desk text."""
     df = load_ipo_pipeline()
     if df.empty:
-        return "*IPO DESK*\nNo IPO data yet (run meta refresh / seed)."
+        return "*IPO DESK*\nNo IPO data yet."
 
-    # Prefer open / upcoming first if Status column exists
     if "Status" in df.columns:
         order = {"open": 0, "upcoming": 1, "closed": 2}
         try:
             df = df.copy()
             df["_ord"] = df["Status"].astype(str).str.lower().map(lambda x: order.get(x, 9))
-            df = df.sort_values("_ord")
+            df = df.sort_values(["_ord", "Name"])
         except Exception:
             pass
 
     lines = [
-        "*IPO DESK – GMP*",
+        "*IPO DESK – GMP + Subscription*",
         f"As of `{datetime.now():%Y-%m-%d %H:%M}`",
-        "_GMP is unofficial grey-market data – not investment advice_",
+        "_GMP unofficial · Sub in times (x) · not advice_",
         "",
         "```",
-        f"{'IPO':<22} {'High':>6} {'GMP':>6} {'%':>6} {'Verdict':>8}",
-        "-" * 54,
+        f"{'IPO':<18} {'GMP':>5} {'%':>5} {'Sub':>6} {'Verdict':>8}",
+        "-" * 48,
     ]
 
     shown = 0
     for _, r in df.iterrows():
         if shown >= max_rows:
             break
-        name = str(r.get("Name", ""))[:22]
+        name = str(r.get("Name", ""))[:18]
         try:
             high = float(r.get("PriceHigh") or 0)
         except Exception:
@@ -276,14 +416,36 @@ def build_ipo_desk_message(max_rows: int = 10) -> str:
             gmp = float(r.get("GMP") or 0)
         except Exception:
             gmp = 0.0
+        try:
+            sub = float(r.get("SubTotal") or 0)
+        except Exception:
+            sub = 0.0
         pct = (gmp / high * 100) if high else 0.0
+        sub_s = f"{sub:.1f}x" if sub else "-"
         lines.append(
-            f"{name:<22} {high:>6.0f} {gmp:>6.0f} {pct:>5.1f}% {_verdict(pct):>8}"
+            f"{name:<18} {gmp:>5.0f} {pct:>4.0f}% {sub_s:>6} {_verdict(pct):>8}"
         )
         shown += 1
 
     lines.append("```")
+
+    # detail lines for open IPOs with category sub
+    detail = []
+    for _, r in df.iterrows():
+        if str(r.get("Status", "")).lower() != "open":
+            continue
+        qib = _to_float(r.get("SubQIB"), 0)
+        nii = _to_float(r.get("SubNII"), 0)
+        rii = _to_float(r.get("SubRetail"), 0)
+        if qib or nii or rii:
+            detail.append(
+                f"• `{str(r.get('Name',''))[:20]}` QIB `{qib:.1f}x` NII `{nii:.1f}x` RII `{rii:.1f}x`"
+            )
+    if detail:
+        lines.append("")
+        lines.append("*Subscription (open)*")
+        lines.extend(detail[:6])
+
     lines.append("")
-    lines.append("• Positive: GMP% ≥ 20 | Neutral: 0–20 | Weak: GMP < 0")
-    lines.append("• Always check RHP / subscription before applying")
+    lines.append("• Positive GMP%≥20 · check RHP before applying")
     return "\n".join(lines)
