@@ -1,0 +1,190 @@
+name: Daily Stock Prediction Pipeline
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    # Morning prediction job.
+    # 03:30 UTC = 09:00 IST
+    - cron: "30 3 * * 1-5"
+
+    # Evening evaluation job.
+    # 11:30 UTC = 17:00 IST
+    - cron: "30 11 * * 1-5"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-stock-pipeline
+  cancel-in-progress: false
+
+jobs:
+
+  morning-predictions:
+
+    name: Morning Predictions
+
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '30 3 * * 1-5'
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 30
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Upgrade pip
+        run: |
+          python -m pip install --upgrade pip
+
+      - name: Install dependencies
+        run: |
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            echo "requirements.txt not found"
+            exit 1
+          fi
+
+      - name: Create required directories
+        run: |
+          mkdir -p data/ledger
+          mkdir -p data/reports
+          mkdir -p data/models
+          mkdir -p logs
+
+      - name: Run morning prediction job
+        env:
+          PYTHONPATH: .
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python scripts/morning_job.py
+
+      - name: Commit prediction ledger and reports
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            data/ledger/ \
+            data/reports/ \
+            data/model_registry.json \
+            logs/ || true
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Automated morning predictions [skip ci]"
+            git push
+          fi
+
+      - name: Upload morning job artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: morning-job-${{ github.run_id }}
+          path: |
+            data/ledger/
+            data/reports/
+            logs/
+          if-no-files-found: warn
+          retention-days: 14
+
+
+  evening-evaluation:
+
+    name: Evening Evaluation
+
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '30 11 * * 1-5'
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 30
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Upgrade pip
+        run: |
+          python -m pip install --upgrade pip
+
+      - name: Install dependencies
+        run: |
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            echo "requirements.txt not found"
+            exit 1
+          fi
+
+      - name: Create required directories
+        run: |
+          mkdir -p data/ledger
+          mkdir -p data/reports
+          mkdir -p data/models
+          mkdir -p logs
+
+      - name: Run evaluation job
+        env:
+          PYTHONPATH: .
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python scripts/evaluation_job.py
+
+      - name: Run Champion Challenger comparison
+        env:
+          PYTHONPATH: .
+        run: |
+          python src/champion_challenger.py || true
+
+      - name: Commit evaluation results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            data/ledger/ \
+            data/reports/ \
+            data/model_registry.json \
+            logs/ || true
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Automated model evaluation [skip ci]"
+            git push
+          fi
+
+      - name: Upload evaluation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evaluation-job-${{ github.run_id }}
+          path: |
+            data/ledger/
+            data/reports/
+            data/model_registry.json
+            logs/
+          if-no-files-found: warn
+          retention-days: 30
