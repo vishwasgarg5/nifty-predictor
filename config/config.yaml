@@ -1,13 +1,20 @@
-# Active universes (can enable multiple)
 universes:
-  primary:
-    - nifty100
-    - nifty500
-  secondary:
-    - midcap150
+  primary: [nifty100, nifty500]
+  secondary: [midcap150]
   include_ipo: true
   ipo_min_trading_days: 30
   ipo_min_avg_volume: 100000
+
+indexes:
+  enabled: true
+  list:
+    - {symbol: "^NSEI", name: "NIFTY50"}
+    - {symbol: "^BSESN", name: "SENSEX"}
+    - {symbol: "^NSEBANK", name: "BANKNIFTY"}
+
+ipo_desk:
+  enabled: true
+  max_rows: 10
 
 top_n: 5
 lookback_days: 180
@@ -22,9 +29,8 @@ scoring:
   min_avg_volume: 100000
   max_atr_pct: 8.0
   prefilter_top: 40
-  weights:
-    technical: 0.70
-    fundamental: 0.30
+  stage1_limit: 220
+  weights: {technical: 0.70, fundamental: 0.30}
 
 model:
   n_estimators: 120
@@ -44,11 +50,12 @@ sentiment:
   use_finbert: true
 
 paths:
-  predictions: "data/predictions"
-  history: "data/history"
-  models: "models"
-  universes_dir: "data/universes"
-  errors_file: "data/history/daily_errors.csv"
-  weekly_file: "data/history/weekly_reports.csv"
-  drift_file: "data/history/drift_log.csv"
-  ipo_file: "data/universes/ipo_watchlist.csv"
+  predictions: data/predictions
+  history: data/history
+  models: models
+  universes_dir: data/universes
+  errors_file: data/history/daily_errors.csv
+  weekly_file: data/history/weekly_reports.csv
+  drift_file: data/history/drift_log.csv
+  ipo_file: data/universes/ipo_watchlist.csv
+  ipo_pipeline: data/ipo_pipeline.csv
