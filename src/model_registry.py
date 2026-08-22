@@ -1,30 +1,25 @@
 #!/usr/bin/env python3
 
 """
-Model Registry.
+Production Model Registry.
 
-Maintains the current production Champion model and Challenger
-model metadata.
+This module manages the registry that identifies which model
+is currently active in production.
 
-The registry stores:
+The registry stores information about:
 
-    - model names
-    - model versions
-    - model paths
-    - model status
-    - promotion history
+    - Champion model
+    - Previous champion
+    - Challenger model
+    - Model paths
+    - Promotion timestamps
+    - Model metadata
 
-States
-------
+The registry is stored as JSON.
 
-CHAMPION
-    Current production model.
+Default location:
 
-CHALLENGER
-    Candidate model being evaluated.
-
-ARCHIVED
-    Previous model retained for historical reference.
+    data/models/model_registry.json
 """
 
 from __future__ import annotations
@@ -51,17 +46,9 @@ if str(PROJECT_ROOT) not in sys.path:
 # LOGGING
 # ============================================================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format=(
-        "%(asctime)s | "
-        "%(levelname)s | "
-        "%(name)s | "
-        "%(message)s"
-    ),
+logger = logging.getLogger(
+    "model_registry"
 )
-
-logger = logging.getLogger("model_registry")
 
 
 # ============================================================
@@ -69,7 +56,7 @@ logger = logging.getLogger("model_registry")
 # ============================================================
 
 def utc_now_iso() -> str:
-    """Return current UTC timestamp."""
+    """Return the current UTC timestamp."""
 
     return datetime.now(
         timezone.utc
@@ -83,7 +70,7 @@ def utc_now_iso() -> str:
 def object_to_dict(
     value: Any,
 ) -> dict[str, Any]:
-    """Convert config object into dictionary."""
+    """Convert configuration objects to dictionaries."""
 
     if value is None:
         return {}
@@ -111,13 +98,15 @@ def load_config() -> Any:
     """Load project configuration."""
 
     try:
+
         from src.config import cfg
+
         return cfg
 
     except Exception as error:
 
         logger.warning(
-            "Could not load config: %s",
+            "Could not load configuration: %s",
             error,
         )
 
@@ -129,34 +118,80 @@ def load_config() -> Any:
 # ============================================================
 
 def get_registry_path() -> Path:
-    """Get model registry file path."""
+    """
+    Get the production model registry path.
+
+    Supported configuration:
+
+        model_registry:
+            path: data/models/model_registry.json
+
+    or:
+
+        models:
+            registry_path: data/models/model_registry.json
+    """
 
     cfg = load_config()
 
+    candidates: list[Any] = []
+
     if cfg is not None:
 
-        section = getattr(
+        registry_section = getattr(
             cfg,
             "model_registry",
             None,
         )
 
-        values = object_to_dict(
-            section
+        registry_values = object_to_dict(
+            registry_section
         )
 
-        path_value = values.get(
-            "registry_file"
+        for key in [
+            "path",
+            "registry_path",
+        ]:
+
+            if registry_values.get(key):
+                candidates.append(
+                    registry_values[key]
+                )
+
+        models_section = getattr(
+            cfg,
+            "models",
+            None,
         )
 
-        if path_value:
+        models_values = object_to_dict(
+            models_section
+        )
+
+        for key in [
+            "registry_path",
+            "model_registry",
+        ]:
+
+            if models_values.get(key):
+                candidates.append(
+                    models_values[key]
+                )
+
+    for candidate in candidates:
+
+        if candidate:
 
             path = Path(
-                str(path_value)
+                str(candidate)
             )
 
             if not path.is_absolute():
-                path = PROJECT_ROOT / path
+
+                path = (
+                    PROJECT_ROOT
+                    / path
+                )
 
             return path
 
@@ -172,28 +207,43 @@ def get_registry_path() -> Path:
 # DEFAULT REGISTRY
 # ============================================================
 
-def default_registry() -> dict[str, Any]:
-    """Create an empty model registry."""
+def get_default_registry() -> dict[str, Any]:
+    """
+    Return an empty production model registry.
+    """
 
     return {
+        "version": 1,
+        "updated_at": utc_now_iso(),
         "champion": None,
+        "previous_champion": None,
         "challenger": None,
         "history": [],
-        "updated_at": utc_now_iso(),
     }
 
 
 # ============================================================
-# LOAD / SAVE
+# REGISTRY IO
 # ============================================================
 
 def load_registry() -> dict[str, Any]:
-    """Load the persistent model registry."""
+    """
+    Load the production model registry.
+
+    If the registry does not exist, an empty registry
+    structure is returned.
+    """
 
     path = get_registry_path()
 
     if not path.exists():
-        return default_registry()
+
+        logger.warning(
+            "Model registry does not exist: %s",
+            path,
+        )
+
+        return get_default_registry()
 
     try:
 
@@ -202,23 +252,9 @@ def load_registry() -> dict[str, Any]:
             encoding="utf-8",
         ) as file:
 
-            registry = json.load(
+            data = json.load(
                 file
             )
-
-        if not isinstance(
-            registry,
-            dict,
-        ):
-            return default_registry()
-
-        result = default_registry()
-
-        result.update(
-            registry
-        )
-
-        return result
 
     except Exception as error:
 
@@ -227,13 +263,46 @@ def load_registry() -> dict[str, Any]:
             error,
         )
 
-        return default_registry()
+        raise RuntimeError(
+            "Model registry could not be loaded."
+        ) from error
+
+    if not isinstance(
+        data,
+        dict,
+    ):
+
+        raise RuntimeError(
+            "Model registry must contain "
+            "a JSON object."
+        )
+
+    defaults = get_default_registry()
+
+    for key, value in defaults.items():
+
+        if key not in data:
+
+            data[key] = value
+
+    return data
 
 
 def save_registry(
     registry: dict[str, Any],
-) -> None:
-    """Save model registry."""
+) -> Path:
+    """
+    Save the production model registry safely.
+    """
+
+    if not isinstance(
+        registry,
+        dict,
+    ):
+
+        raise TypeError(
+            "Registry must be a dictionary."
+        )
 
     path = get_registry_path()
 
@@ -242,45 +311,123 @@ def save_registry(
         exist_ok=True,
     )
 
+    registry = dict(
+        registry
+    )
+
     registry["updated_at"] = (
         utc_now_iso()
     )
 
-    with path.open(
-        "w",
-        encoding="utf-8",
-    ) as file:
+    temporary_path = (
+        path.with_suffix(
+            ".tmp"
+        )
+    )
 
-        json.dump(
-            registry,
-            file,
-            indent=2,
-            default=str,
+    try:
+
+        with temporary_path.open(
+            "w",
+            encoding="utf-8",
+        ) as file:
+
+            json.dump(
+                registry,
+                file,
+                indent=2,
+                ensure_ascii=False,
+                default=str,
+            )
+
+        temporary_path.replace(
+            path
         )
 
+    except Exception as error:
+
+        logger.error(
+            "Could not save model registry: %s",
+            error,
+        )
+
+        if temporary_path.exists():
+
+            try:
+                temporary_path.unlink()
+            except Exception:
+                pass
+
+        raise
+
+    logger.info(
+        "Model registry saved: %s",
+        path,
+    )
+
+    return path
+
 
 # ============================================================
-# MODEL BUILDERS
+# MODEL PATH HELPERS
 # ============================================================
 
-def build_model_record(
-    name: str,
-    version: str,
-    path: str | None = None,
-    metrics: dict[str, Any] | None = None,
-    status: str = "CHALLENGER",
-) -> dict[str, Any]:
-    """Build a standard model record."""
+def resolve_model_path(
+    value: Any,
+) -> Path | None:
+    """
+    Convert a model path into an absolute Path.
+    """
 
-    return {
-        "name": str(name),
-        "version": str(version),
-        "path": path,
-        "status": str(status).upper(),
-        "metrics": metrics or {},
-        "created_at": utc_now_iso(),
-        "updated_at": utc_now_iso(),
-    }
+    if value is None:
+        return None
+
+    text = str(
+        value
+    ).strip()
+
+    if not text:
+        return None
+
+    path = Path(
+        text
+    )
+
+    if not path.is_absolute():
+
+        path = (
+            PROJECT_ROOT
+            / path
+        )
+
+    return path
+
+
+def get_model_path(
+    model_info: dict[str, Any] | None,
+) -> Path | None:
+    """
+    Extract the model file path from registry metadata.
+    """
+
+    if not model_info:
+
+        return None
+
+    for key in [
+        "path",
+        "model_path",
+        "file_path",
+        "artifact_path",
+    ]:
+
+        if model_info.get(key):
+
+            return resolve_model_path(
+                model_info[key]
+            )
+
+    return None
 
 
 # ============================================================
@@ -288,7 +435,9 @@ def build_model_record(
 # ============================================================
 
 def get_champion() -> dict[str, Any] | None:
-    """Return current champion model."""
+    """
+    Return the currently registered Champion.
+    """
 
     registry = load_registry()
 
@@ -296,71 +445,41 @@ def get_champion() -> dict[str, Any] | None:
         "champion"
     )
 
-    if isinstance(
+    if not isinstance(
         champion,
         dict,
     ):
-        return champion
 
-    return None
+        return None
+
+    return dict(
+        champion
+    )
 
 
-def set_champion(
-    name: str,
-    version: str,
-    path: str | None = None,
-    metrics: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+def get_champion_path() -> Path | None:
     """
-    Set a model as Champion.
-
-    Existing champion is archived.
+    Return the current Champion model path.
     """
 
-    registry = load_registry()
+    champion = get_champion()
 
-    old_champion = registry.get(
-        "champion"
+    return get_model_path(
+        champion
     )
 
-    if isinstance(
-        old_champion,
-        dict,
-    ):
 
-        old_champion["status"] = (
-            "ARCHIVED"
-        )
+def has_champion() -> bool:
+    """
+    Check whether a valid Champion exists.
+    """
 
-        old_champion["archived_at"] = (
-            utc_now_iso()
-        )
+    path = get_champion_path()
 
-        registry["history"].append(
-            old_champion
-        )
+    if path is None:
+        return False
 
-    champion = build_model_record(
-        name=name,
-        version=version,
-        path=path,
-        metrics=metrics,
-        status="CHAMPION",
-    )
-
-    registry["champion"] = champion
-
-    save_registry(
-        registry
-    )
-
-    logger.info(
-        "Champion set: %s %s",
-        name,
-        version,
-    )
-
-    return champion
+    return path.exists()
 
 
 # ============================================================
@@ -368,7 +487,9 @@ def set_champion(
 # ============================================================
 
 def get_challenger() -> dict[str, Any] | None:
-    """Return current challenger model."""
+    """
+    Return the currently registered Challenger.
+    """
 
     registry = load_registry()
 
@@ -376,107 +497,211 @@ def get_challenger() -> dict[str, Any] | None:
         "challenger"
     )
 
-    if isinstance(
+    if not isinstance(
         challenger,
         dict,
     ):
-        return challenger
 
-    return None
+        return None
+
+    return dict(
+        challenger
+    )
 
 
-def set_challenger(
-    name: str,
-    version: str,
-    path: str | None = None,
-    metrics: dict[str, Any] | None = None,
+# ============================================================
+# MODEL REGISTRATION
+# ============================================================
+
+def create_model_record(
+    model_name: str,
+    model_path: str | Path,
+    model_type: str | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Register a Challenger model."""
+    """
+    Create a normalized model registry record.
+    """
+
+    path = resolve_model_path(
+        model_path
+    )
+
+    if path is None:
+
+        raise ValueError(
+            "Model path is required."
+        )
+
+    try:
+
+        relative_path = path.relative_to(
+            PROJECT_ROOT
+        )
+
+        stored_path = str(
+            relative_path
+        )
+
+    except ValueError:
+
+        stored_path = str(
+            path
+        )
+
+    record: dict[str, Any] = {
+        "name": str(
+            model_name
+        ),
+        "path": stored_path,
+        "model_type": (
+            model_type
+            if model_type
+            else "unknown"
+        ),
+        "registered_at": utc_now_iso(),
+    }
+
+    if metadata:
+
+        record["metadata"] = dict(
+            metadata
+        )
+
+    return record
+
+
+def register_challenger(
+    model_name: str,
+    model_path: str | Path,
+    model_type: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Register a Challenger model.
+    """
 
     registry = load_registry()
 
-    challenger = build_model_record(
-        name=name,
-        version=version,
-        path=path,
-        metrics=metrics,
-        status="CHALLENGER",
+    challenger = (
+        create_model_record(
+            model_name=model_name,
+            model_path=model_path,
+            model_type=model_type,
+            metadata=metadata,
+        )
     )
 
-    registry["challenger"] = challenger
+    registry["challenger"] = (
+        challenger
+    )
+
+    history = registry.setdefault(
+        "history",
+        [],
+    )
+
+    history.append(
+        {
+            "event": (
+                "CHALLENGER_REGISTERED"
+            ),
+            "timestamp": utc_now_iso(),
+            "model": challenger,
+        }
+    )
 
     save_registry(
         registry
     )
 
     logger.info(
-        "Challenger registered: %s %s",
-        name,
-        version,
+        "Registered Challenger: %s",
+        challenger.get("name"),
     )
 
     return challenger
 
 
-# ============================================================
-# METRICS
-# ============================================================
-
-def update_model_metrics(
-    role: str,
-    metrics: dict[str, Any],
-) -> dict[str, Any] | None:
+def set_champion(
+    model_name: str,
+    model_path: str | Path,
+    model_type: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    reason: str = "MANUAL",
+) -> dict[str, Any]:
     """
-    Update Champion or Challenger metrics.
+    Set a model as the production Champion.
+
+    The existing Champion is automatically preserved
+    as previous_champion.
     """
-
-    role = str(
-        role
-    ).lower()
-
-    if role not in {
-        "champion",
-        "challenger",
-    }:
-        raise ValueError(
-            "role must be champion or challenger"
-        )
 
     registry = load_registry()
 
-    model = registry.get(
-        role
+    old_champion = registry.get(
+        "champion"
     )
 
-    if not isinstance(
-        model,
-        dict,
-    ):
-        return None
+    champion = (
+        create_model_record(
+            model_name=model_name,
+            model_path=model_path,
+            model_type=model_type,
+            metadata=metadata,
+        )
+    )
 
-    model["metrics"] = metrics
-    model["updated_at"] = utc_now_iso()
+    if old_champion:
 
-    registry[role] = model
+        registry[
+            "previous_champion"
+        ] = old_champion
+
+    registry["champion"] = (
+        champion
+    )
+
+    history = registry.setdefault(
+        "history",
+        [],
+    )
+
+    history.append(
+        {
+            "event": "CHAMPION_SET",
+            "timestamp": utc_now_iso(),
+            "reason": reason,
+            "model": champion,
+            "previous_champion": (
+                old_champion
+            ),
+        }
+    )
 
     save_registry(
         registry
     )
 
-    return model
+    logger.info(
+        "Champion set: %s",
+        champion.get("name"),
+    )
+
+    return champion
 
 
 # ============================================================
-# PROMOTION
+# PROMOTE REGISTERED CHALLENGER
 # ============================================================
 
-def promote_challenger(
-    reason: str,
-) -> dict[str, Any] | None:
+def promote_registered_challenger(
+    reason: str = "AUTOMATIC_PROMOTION",
+) -> dict[str, Any]:
     """
-    Promote current Challenger to Champion.
+    Promote the currently registered Challenger.
 
-    Existing Champion is archived.
+    The current Champion becomes previous_champion.
     """
 
     registry = load_registry()
@@ -490,72 +715,180 @@ def promote_challenger(
         dict,
     ):
 
-        logger.warning(
-            "No Challenger available "
-            "for promotion."
+        raise RuntimeError(
+            "No Challenger is registered."
         )
 
-        return None
-
-    old_champion = registry.get(
-        "champion"
-    )
-
-    if isinstance(
-        old_champion,
-        dict,
-    ):
-
-        old_champion["status"] = (
-            "ARCHIVED"
-        )
-
-        old_champion["archived_at"] = (
-            utc_now_iso()
-        )
-
-        old_champion[
-            "archive_reason"
-        ] = (
-            "Replaced by Challenger."
-        )
-
-        registry["history"].append(
-            old_champion
-        )
-
-    challenger["status"] = (
-        "CHAMPION"
-    )
-
-    challenger["promoted_at"] = (
-        utc_now_iso()
-    )
-
-    challenger[
-        "promotion_reason"
-    ] = str(reason)
-
-    challenger["updated_at"] = (
-        utc_now_iso()
-    )
-
-    registry["champion"] = (
+    challenger_path = get_model_path(
         challenger
     )
 
+    if challenger_path is None:
+
+        raise RuntimeError(
+            "Challenger model path is missing."
+        )
+
+    if not challenger_path.exists():
+
+        raise RuntimeError(
+            "Challenger model file does not exist: "
+            f"{challenger_path}"
+        )
+
+    previous_champion = registry.get(
+        "champion"
+    )
+
+    registry[
+        "previous_champion"
+    ] = previous_champion
+
+    promoted_champion = dict(
+        challenger
+    )
+
+    promoted_champion[
+        "promoted_at"
+    ] = utc_now_iso()
+
+    promoted_champion[
+        "promotion_reason"
+    ] = reason
+
+    registry["champion"] = (
+        promoted_champion
+    )
+
     registry["challenger"] = None
+
+    history = registry.setdefault(
+        "history",
+        [],
+    )
+
+    history.append(
+        {
+            "event": "CHALLENGER_PROMOTED",
+            "timestamp": utc_now_iso(),
+            "reason": reason,
+            "champion": (
+                promoted_champion
+            ),
+            "previous_champion": (
+                previous_champion
+            ),
+        }
+    )
+
+    save_registry(
+        registry
+    )
+
+    logger.info(
+        "Challenger promoted to Champion: %s",
+        promoted_champion.get("name"),
+    )
+
+    return promoted_champion
+
+
+# ============================================================
+# ROLLBACK
+# ============================================================
+
+def rollback_to_previous_champion(
+    reason: str = "MANUAL_ROLLBACK",
+) -> dict[str, Any]:
+    """
+    Roll back to the previous Champion.
+    """
+
+    registry = load_registry()
+
+    current_champion = registry.get(
+        "champion"
+    )
+
+    previous_champion = registry.get(
+        "previous_champion"
+    )
+
+    if not isinstance(
+        previous_champion,
+        dict,
+    ):
+
+        raise RuntimeError(
+            "No previous Champion is available."
+        )
+
+    previous_path = get_model_path(
+        previous_champion
+    )
+
+    if previous_path is None:
+
+        raise RuntimeError(
+            "Previous Champion path is missing."
+        )
+
+    if not previous_path.exists():
+
+        raise RuntimeError(
+            "Previous Champion file does not exist: "
+            f"{previous_path}"
+        )
+
+    restored_champion = dict(
+        previous_champion
+    )
+
+    restored_champion[
+        "restored_at"
+    ] = utc_now_iso()
+
+    restored_champion[
+        "rollback_reason"
+    ] = reason
+
+    registry["champion"] = (
+        restored_champion
+    )
+
+    registry[
+        "previous_champion"
+    ] = current_champion
+
+    history = registry.setdefault(
+        "history",
+        [],
+    )
+
+    history.append(
+        {
+            "event": "ROLLBACK",
+            "timestamp": utc_now_iso(),
+            "reason": reason,
+            "restored_champion": (
+                restored_champion
+            ),
+            "replaced_champion": (
+                current_champion
+            ),
+        }
+    )
 
     save_registry(
         registry
     )
 
     logger.warning(
-        "CHALLENGER PROMOTED TO CHAMPION | %s",
-        reason,
+        "Rolled back Champion to: %s",
+        restored_champion.get("name"),
     )
 
-    return challenger
+    return restored_champion
 
 
 # ============================================================
@@ -563,7 +896,9 @@ def promote_challenger(
 # ============================================================
 
 def get_registry_status() -> dict[str, Any]:
-    """Return registry summary."""
+    """
+    Return a safe summary of registry status.
+    """
 
     registry = load_registry()
 
@@ -575,17 +910,41 @@ def get_registry_status() -> dict[str, Any]:
         "challenger"
     )
 
+    previous = registry.get(
+        "previous_champion"
+    )
+
+    champion_path = get_model_path(
+        champion
+        if isinstance(champion, dict)
+        else None
+    )
+
     return {
+        "registry_path": str(
+            get_registry_path()
+        ),
         "champion": champion,
+        "champion_path": (
+            str(champion_path)
+            if champion_path
+            else None
+        ),
+        "champion_exists": (
+            champion_path.exists()
+            if champion_path
+            else False
+        ),
         "challenger": challenger,
+        "previous_champion": previous,
+        "updated_at": registry.get(
+            "updated_at"
+        ),
         "history_count": len(
             registry.get(
                 "history",
                 [],
             )
-        ),
-        "updated_at": registry.get(
-            "updated_at"
         ),
     }
 
@@ -595,6 +954,9 @@ def get_registry_status() -> dict[str, Any]:
 # ============================================================
 
 def main() -> int:
+    """Display model registry status."""
+
+    import json
 
     status = get_registry_status()
 
@@ -602,43 +964,16 @@ def main() -> int:
 
     print("=" * 70)
 
-    print("MODEL REGISTRY")
+    print("PRODUCTION MODEL REGISTRY")
 
     print("=" * 70)
 
-    champion = status.get(
-        "champion"
-    )
-
-    challenger = status.get(
-        "challenger"
-    )
-
-    print()
-
-    print("Champion:")
-
     print(
-        champion
-        if champion
-        else "None"
-    )
-
-    print()
-
-    print("Challenger:")
-
-    print(
-        challenger
-        if challenger
-        else "None"
-    )
-
-    print()
-
-    print(
-        "Archived models: "
-        f"{status.get('history_count')}"
+        json.dumps(
+            status,
+            indent=2,
+            default=str,
+        )
     )
 
     return 0
