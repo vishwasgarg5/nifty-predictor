@@ -1,3 +1,11 @@
+# ============================================
+# NSE STOCK PREDICTION SYSTEM CONFIGURATION
+# ============================================
+
+# --------------------------------------------
+# STOCK UNIVERSE
+# --------------------------------------------
+
 universes:
   primary:
     - nifty100
@@ -7,9 +15,14 @@ universes:
     - midcap150
 
   include_ipo: true
+
   ipo_min_trading_days: 30
   ipo_min_avg_volume: 100000
 
+
+# --------------------------------------------
+# MARKET INDEXES
+# --------------------------------------------
 
 indexes:
   enabled: true
@@ -28,19 +41,107 @@ indexes:
       name: "NIFTY_IT"
 
 
+# --------------------------------------------
+# IPO DESK
+# --------------------------------------------
+
 ipo_desk:
   enabled: true
   max_rows: 10
 
 
+# --------------------------------------------
+# OUTPUT
+# --------------------------------------------
+
 top_n: 5
 
 
-lookback_days: 180
+# --------------------------------------------
+# HISTORICAL DATA
+# --------------------------------------------
 
+lookback_days: 180
 
 min_history_days: 60
 
+
+# --------------------------------------------
+# LIQUIDITY FILTER
+# --------------------------------------------
+
+# Number of historical trading days used to
+# calculate average volume and traded value.
+liquidity_lookback_days: 60
+
+
+universe_filter:
+  enabled: true
+
+  # Maximum liquid stocks that move to the
+  # more expensive feature/scoring stage.
+  max_candidates: 250
+
+  min_avg_volume: 100000
+
+  liquidity_lookback_days: 60
+
+
+# --------------------------------------------
+# FEATURE ENGINE
+# --------------------------------------------
+
+feature_version: "features-v2"
+
+
+features:
+
+  version: "features-v2"
+
+  # Minimum proportion of valid features
+  # required for a stock to be considered
+  # usable by the ML pipeline.
+  min_quality_score: 0.85
+
+
+  technical:
+
+    rsi_period: 14
+
+    sma_short: 20
+
+    sma_long: 50
+
+    atr_period: 14
+
+    volatility_period: 20
+
+
+  point_in_time:
+
+    # Prevent future data leakage when
+    # generating features.
+    enabled: true
+
+
+# --------------------------------------------
+# MARKET REGIME
+# --------------------------------------------
+
+market_regime:
+
+  symbol: "^NSEI"
+
+  lookback_days: 120
+
+  bullish_threshold: 2
+
+  bearish_threshold: -2
+
+
+# --------------------------------------------
+# STOCK SCORING
+# --------------------------------------------
 
 scoring:
 
@@ -58,22 +159,35 @@ scoring:
 
   max_atr_pct: 8.0
 
+
+  # Number of liquid stocks that move into
+  # full technical/fundamental scoring.
+  #
+  # This replaces alphabetical symbols[:220].
+  stage1_limit: 250
+
+
+  # Number of strongest candidates retained
+  # before the final Top N selection.
   prefilter_top: 40
 
-  stage1_limit: 220
 
   weights:
+
     technical: 0.70
+
     fundamental: 0.30
 
 
-# Version of the feature pipeline.
-feature_version: "features-v1"
-
+# --------------------------------------------
+# MODEL
+# --------------------------------------------
 
 model:
 
-  # Increment this whenever the model logic changes.
+  # Change this whenever model logic,
+  # training data or feature definitions
+  # materially change.
   version: "ohlc-v1"
 
   n_estimators: 120
@@ -83,18 +197,39 @@ model:
   learning_rate: 0.05
 
 
+# --------------------------------------------
+# MODEL DRIFT
+# --------------------------------------------
+
 drift:
 
+  # Alert when recent average percentage
+  # prediction error exceeds this value.
   mape_threshold: 3.5
 
+
+  # Alert when directional accuracy drops
+  # below this percentage.
   dir_acc_threshold: 52
 
+
+  # Number of calendar days used when
+  # evaluating recent model performance.
   lookback_days: 10
 
 
+# --------------------------------------------
+# MODEL TUNING
+# --------------------------------------------
+
 tuning:
+
   enabled: true
 
+
+# --------------------------------------------
+# NEWS / SENTIMENT
+# --------------------------------------------
 
 sentiment:
 
@@ -103,29 +238,52 @@ sentiment:
   use_finbert: true
 
 
+# --------------------------------------------
+# FILE PATHS
+# --------------------------------------------
+
 paths:
 
+  # Daily prediction output.
   predictions: "data/predictions"
 
+
+  # Historical reports and error data.
   history: "data/history"
 
+
+  # Saved ML models.
   models: "models"
 
+
+  # Stock universe and IPO watchlists.
   universes_dir: "data/universes"
 
-  # Old file retained for backward compatibility.
+
+  # Retained for backward compatibility.
+  # New evaluation uses prediction_ledger.csv.
   errors_file: "data/history/daily_errors.csv"
 
-  # New immutable prediction ledger.
+
+  # Immutable prediction ledger.
   ledger_file: "data/predictions/prediction_ledger.csv"
+
 
   # Daily model evaluation metrics.
   metrics_file: "data/evaluation/model_metrics.csv"
 
+
+  # Weekly reporting.
   weekly_file: "data/history/weekly_reports.csv"
 
+
+  # Drift history.
   drift_file: "data/history/drift_log.csv"
 
+
+  # IPO universe.
   ipo_file: "data/universes/ipo_watchlist.csv"
 
+
+  # IPO processing pipeline.
   ipo_pipeline: "data/ipo_pipeline.csv"
