@@ -1,29 +1,12 @@
-from __future__ import annotations
-
 import logging
 import time
 from datetime import datetime, timedelta
-from typing import Any
 
 import pandas as pd
 import yfinance as yf
 
 
 logger = logging.getLogger(__name__)
-
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-DEFAULT_PERIOD = "6mo"
-
-REQUIRED_COLUMNS = [
-    "Open",
-    "High",
-    "Low",
-    "Close",
-]
 
 
 # ============================================================
@@ -34,600 +17,207 @@ def _session():
     """
     Create a curl_cffi session when available.
 
-    GitHub Actions can sometimes have better compatibility with
-    Yahoo Finance when curl_cffi impersonation is used.
+    This can improve Yahoo Finance reliability,
+    especially in GitHub Actions.
     """
 
     try:
-
         from curl_cffi import requests as cffi_requests
 
         return cffi_requests.Session(
             impersonate="chrome"
         )
 
-    except Exception as error:
-
-        logger.debug(
-            "curl_cffi session unavailable: %s",
-            error,
-        )
+    except Exception:
 
         return None
 
 
 # ============================================================
-# SYMBOL NORMALIZATION
-# ============================================================
-
-def normalize_symbol(
-    symbol: Any,
-) -> str:
-    """
-    Normalize NSE symbols.
-
-    Examples:
-
-        RELIANCE     -> RELIANCE.NS
-        RELIANCE.NS  -> RELIANCE.NS
-        ^NSEI        -> ^NSEI
-        TCS.BO       -> TCS.BO
-    """
-
-    if symbol is None:
-
-        return ""
-
-    value = str(symbol).strip().upper()
-
-    if not value:
-
-        return ""
-
-    if value.startswith("^"):
-
-        return value
-
-    if value.endswith(".NS"):
-
-        return value
-
-    if value.endswith(".BO"):
-
-        return value
-
-    if "." in value:
-
-        return value
-
-    return f"{value}.NS"
-
-
-# ============================================================
-# DATA CLEANING
-# ============================================================
-
-def _clean_history(
-    frame: pd.DataFrame | None,
-) -> pd.DataFrame:
-    """
-    Clean a Yahoo Finance DataFrame.
-
-    Handles:
-
-        - None
-        - empty DataFrames
-        - MultiIndex columns
-        - missing OHLC columns
-        - invalid numeric values
-        - duplicate timestamps
-    """
-
-    if frame is None:
-
-        return pd.DataFrame()
-
-    if not isinstance(
-        frame,
-        pd.DataFrame,
-    ):
-
-        return pd.DataFrame()
-
-    if frame.empty:
-
-        return pd.DataFrame()
-
-    frame = frame.copy()
-
-    # --------------------------------------------------------
-    # Flatten MultiIndex columns
-    # --------------------------------------------------------
-
-    if isinstance(
-        frame.columns,
-        pd.MultiIndex,
-    ):
-
-        frame.columns = [
-            str(column[0])
-            for column in frame.columns
-        ]
-
-    # --------------------------------------------------------
-    # Remove duplicate column names
-    # --------------------------------------------------------
-
-    frame = frame.loc[
-        :,
-        ~frame.columns.duplicated(),
-    ]
-
-    # --------------------------------------------------------
-    # Ensure expected columns exist
-    # --------------------------------------------------------
-
-    missing = [
-        column
-        for column in REQUIRED_COLUMNS
-        if column not in frame.columns
-    ]
-
-    if missing:
-
-        logger.debug(
-            "Missing OHLC columns: %s",
-            missing,
-        )
-
-        return pd.DataFrame()
-
-    # --------------------------------------------------------
-    # Convert OHLCV columns to numeric
-    # --------------------------------------------------------
-
-    for column in [
-        "Open",
-        "High",
-        "Low",
-        "Close",
-        "Adj Close",
-        "Volume",
-    ]:
-
-        if column in frame.columns:
-
-            frame[column] = pd.to_numeric(
-                frame[column],
-                errors="coerce",
-            )
-
-    # --------------------------------------------------------
-    # Remove invalid rows
-    # --------------------------------------------------------
-
-    frame = frame.dropna(
-        subset=[
-            "Open",
-            "High",
-            "Low",
-            "Close",
-        ],
-    )
-
-    if frame.empty:
-
-        return pd.DataFrame()
-
-    # --------------------------------------------------------
-    # Sort index
-    # --------------------------------------------------------
-
-    try:
-
-        frame = frame.sort_index()
-
-        frame = frame.loc[
-            ~frame.index.duplicated(
-                keep="last"
-            )
-        ]
-
-    except Exception:
-
-        pass
-
-    return frame
-
-
-# ============================================================
-# YFINANCE TICKER HISTORY
-# ============================================================
-
-def _ticker_history(
-    symbol: str,
-    period: str,
-    timeout: int = 30,
-) -> pd.DataFrame:
-    """
-    Fetch history using yf.Ticker().history().
-    """
-
-    session = _session()
-
-    logger.debug(
-        "Trying yf.Ticker history for %s",
-        symbol,
-    )
-
-    if session is not None:
-
-        ticker = yf.Ticker(
-            symbol,
-            session=session,
-        )
-
-    else:
-
-        ticker = yf.Ticker(
-            symbol
-        )
-
-    frame = ticker.history(
-        period=period,
-        auto_adjust=True,
-        timeout=timeout,
-        raise_errors=False,
-    )
-
-    return _clean_history(
-        frame
-    )
-
-
-# ============================================================
-# YFINANCE DOWNLOAD FALLBACK
-# ============================================================
-
-def _download_history(
-    symbol: str,
-    period: str,
-    timeout: int = 30,
-) -> pd.DataFrame:
-    """
-    Fetch history using yf.download().
-
-    This provides a second Yahoo Finance access path.
-    """
-
-    logger.debug(
-        "Trying yf.download for %s",
-        symbol,
-    )
-
-    frame = yf.download(
-        tickers=symbol,
-        period=period,
-        interval="1d",
-        auto_adjust=True,
-        progress=False,
-        threads=False,
-        timeout=timeout,
-    )
-
-    return _clean_history(
-        frame
-    )
-
-
-# ============================================================
-# DATE RANGE FALLBACK
-# ============================================================
-
-def _date_range_history(
-    symbol: str,
-    days: int = 30,
-    timeout: int = 30,
-) -> pd.DataFrame:
-    """
-    Fetch history using an explicit date range.
-
-    This is useful when the period parameter fails.
-    """
-
-    end = datetime.utcnow()
-
-    start = (
-        end
-        - timedelta(
-            days=max(
-                7,
-                int(days),
-            )
-        )
-    )
-
-    session = _session()
-
-    logger.debug(
-        "Trying explicit date range for %s",
-        symbol,
-    )
-
-    try:
-
-        if session is not None:
-
-            ticker = yf.Ticker(
-                symbol,
-                session=session,
-            )
-
-        else:
-
-            ticker = yf.Ticker(
-                symbol
-            )
-
-        frame = ticker.history(
-            start=start.strftime(
-                "%Y-%m-%d"
-            ),
-            end=(
-                end
-                + timedelta(days=1)
-            ).strftime(
-                "%Y-%m-%d"
-            ),
-            auto_adjust=True,
-            timeout=timeout,
-            raise_errors=False,
-        )
-
-        frame = _clean_history(
-            frame
-        )
-
-        if not frame.empty:
-
-            return frame
-
-    except Exception as error:
-
-        logger.debug(
-            "Ticker date-range attempt failed "
-            "for %s: %s",
-            symbol,
-            error,
-        )
-
-    try:
-
-        frame = yf.download(
-            tickers=symbol,
-            start=start.strftime(
-                "%Y-%m-%d"
-            ),
-            end=(
-                end
-                + timedelta(days=1)
-            ).strftime(
-                "%Y-%m-%d"
-            ),
-            interval="1d",
-            auto_adjust=True,
-            progress=False,
-            threads=False,
-            timeout=timeout,
-        )
-
-        return _clean_history(
-            frame
-        )
-
-    except Exception as error:
-
-        logger.debug(
-            "Download date-range attempt failed "
-            "for %s: %s",
-            symbol,
-            error,
-        )
-
-        return pd.DataFrame()
-
-
-# ============================================================
-# MAIN HISTORY DOWNLOADER
+# YAHOO HISTORY DOWNLOAD
 # ============================================================
 
 def download_history(
     symbol: str,
-    period: str = DEFAULT_PERIOD,
+    period: str = "6mo",
     retries: int = 3,
 ) -> pd.DataFrame | None:
     """
-    Download historical OHLCV market data.
+    Download historical OHLCV data from Yahoo Finance.
 
-    Fallback order:
-
-        1. yf.Ticker().history()
-        2. yf.download()
-        3. Explicit date-range request
-
-    Returns:
-
-        Clean pandas DataFrame
-
-    Returns None when all attempts fail.
+    Returns a DataFrame or None.
     """
 
-    symbol = normalize_symbol(
-        symbol
-    )
+    session = _session()
 
-    if not symbol:
-
-        logger.error(
-            "Cannot download market data: "
-            "empty symbol."
-        )
-
-        return None
-
-    retries = max(
-        1,
-        int(retries),
-    )
-
-    last_error: Exception | None = None
+    last_error = None
 
     for attempt in range(
         1,
         retries + 1,
     ):
 
-        logger.info(
-            "Downloading market data | "
-            "symbol=%s | "
-            "attempt=%s/%s",
-            symbol,
-            attempt,
-            retries,
-        )
-
-        # ----------------------------------------------------
-        # METHOD 1
-        # ----------------------------------------------------
-
         try:
-
-            frame = _ticker_history(
-                symbol=symbol,
-                period=period,
-            )
-
-            if not frame.empty:
-
-                logger.info(
-                    "Market data loaded | "
-                    "symbol=%s | "
-                    "rows=%s | "
-                    "source=yf.Ticker",
-                    symbol,
-                    len(frame),
-                )
-
-                return frame
-
-        except Exception as error:
-
-            last_error = error
-
-            logger.warning(
-                "yf.Ticker failed | "
-                "symbol=%s | "
-                "error=%s",
-                symbol,
-                error,
-            )
-
-        # ----------------------------------------------------
-        # METHOD 2
-        # ----------------------------------------------------
-
-        try:
-
-            frame = _download_history(
-                symbol=symbol,
-                period=period,
-            )
-
-            if not frame.empty:
-
-                logger.info(
-                    "Market data loaded | "
-                    "symbol=%s | "
-                    "rows=%s | "
-                    "source=yf.download",
-                    symbol,
-                    len(frame),
-                )
-
-                return frame
-
-        except Exception as error:
-
-            last_error = error
-
-            logger.warning(
-                "yf.download failed | "
-                "symbol=%s | "
-                "error=%s",
-                symbol,
-                error,
-            )
-
-        # ----------------------------------------------------
-        # METHOD 3
-        # ----------------------------------------------------
-
-        try:
-
-            frame = _date_range_history(
-                symbol=symbol,
-                days=30,
-            )
-
-            if not frame.empty:
-
-                logger.info(
-                    "Market data loaded | "
-                    "symbol=%s | "
-                    "rows=%s | "
-                    "source=date_range",
-                    symbol,
-                    len(frame),
-                )
-
-                return frame
-
-        except Exception as error:
-
-            last_error = error
-
-            logger.warning(
-                "Date-range fallback failed | "
-                "symbol=%s | "
-                "error=%s",
-                symbol,
-                error,
-            )
-
-        # ----------------------------------------------------
-        # RETRY DELAY
-        # ----------------------------------------------------
-
-        if attempt < retries:
-
-            delay = float(
-                attempt * 2
-            )
 
             logger.info(
-                "Retrying %s after %.1f seconds.",
+                "Downloading Yahoo history | "
+                "symbol=%s | attempt=%s/%s",
                 symbol,
-                delay,
+                attempt,
+                retries,
             )
 
-            time.sleep(
-                delay
+            if session is not None:
+
+                ticker = yf.Ticker(
+                    symbol,
+                    session=session,
+                )
+
+            else:
+
+                ticker = yf.Ticker(
+                    symbol
+                )
+
+            # ------------------------------------------------
+            # PRIMARY DOWNLOAD
+            # ------------------------------------------------
+
+            frame = ticker.history(
+                period=period,
+                auto_adjust=True,
+                timeout=30,
             )
+
+            # ------------------------------------------------
+            # DATE RANGE FALLBACK
+            # ------------------------------------------------
+
+            if frame is None or frame.empty:
+
+                end = datetime.utcnow()
+
+                start = (
+                    end
+                    - timedelta(
+                        days=220
+                    )
+                )
+
+                logger.warning(
+                    "Period download empty for %s. "
+                    "Trying date range.",
+                    symbol,
+                )
+
+                frame = ticker.history(
+                    start=start.strftime(
+                        "%Y-%m-%d"
+                    ),
+                    end=end.strftime(
+                        "%Y-%m-%d"
+                    ),
+                    auto_adjust=True,
+                    timeout=30,
+                )
+
+            # ------------------------------------------------
+            # VALIDATION
+            # ------------------------------------------------
+
+            if frame is None or frame.empty:
+
+                raise ValueError(
+                    "Yahoo returned empty history."
+                )
+
+            frame = frame.copy()
+
+            # Flatten MultiIndex columns if Yahoo returns them.
+            if isinstance(
+                frame.columns,
+                pd.MultiIndex,
+            ):
+
+                frame.columns = (
+                    frame.columns
+                    .get_level_values(0)
+                )
+
+            # Standardize column names.
+            frame.columns = [
+                str(column).strip()
+                for column in frame.columns
+            ]
+
+            required_columns = [
+                "Open",
+                "High",
+                "Low",
+                "Close",
+            ]
+
+            missing = [
+                column
+                for column in required_columns
+                if column not in frame.columns
+            ]
+
+            if missing:
+
+                raise ValueError(
+                    "Missing required columns: "
+                    + ", ".join(missing)
+                )
+
+            frame = frame.dropna(
+                subset=[
+                    "Open",
+                    "High",
+                    "Low",
+                    "Close",
+                ]
+            )
+
+            if frame.empty:
+
+                raise ValueError(
+                    "No valid OHLC rows."
+                )
+
+            frame = frame.sort_index()
+
+            logger.info(
+                "Yahoo history loaded | "
+                "symbol=%s | rows=%s",
+                symbol,
+                len(frame),
+            )
+
+            return frame
+
+        except Exception as error:
+
+            last_error = error
+
+            logger.warning(
+                "Yahoo download failed | "
+                "symbol=%s | attempt=%s/%s | error=%s",
+                symbol,
+                attempt,
+                retries,
+                error,
+            )
+
+            if attempt < retries:
+
+                time.sleep(
+                    float(attempt) * 2.0
+                )
 
     logger.error(
-        "Could not load market data | "
-        "symbol=%s | "
-        "last_error=%s",
+        "Yahoo history failed for %s: %s",
         symbol,
         last_error,
     )
@@ -636,97 +226,16 @@ def download_history(
 
 
 # ============================================================
-# STANDARD PIPELINE API
-# ============================================================
-
-def load_market_data(
-    symbol: str,
-    period: str = DEFAULT_PERIOD,
-    retries: int = 3,
-) -> pd.DataFrame:
-    """
-    Standard market data loader.
-
-    This function is intended for the prediction pipeline.
-
-    Raises RuntimeError if data cannot be loaded.
-    """
-
-    frame = download_history(
-        symbol=symbol,
-        period=period,
-        retries=retries,
-    )
-
-    if frame is None or frame.empty:
-
-        raise RuntimeError(
-            f"Could not load market data "
-            f"for {normalize_symbol(symbol)}."
-        )
-
-    return frame
-
-
-def get_market_data(
-    symbol: str,
-    period: str = DEFAULT_PERIOD,
-    retries: int = 3,
-) -> pd.DataFrame:
-    """
-    Compatibility alias for load_market_data().
-    """
-
-    return load_market_data(
-        symbol=symbol,
-        period=period,
-        retries=retries,
-    )
-
-
-def load_data(
-    symbol: str,
-    period: str = DEFAULT_PERIOD,
-    retries: int = 3,
-) -> pd.DataFrame:
-    """
-    Compatibility alias for load_market_data().
-    """
-
-    return load_market_data(
-        symbol=symbol,
-        period=period,
-        retries=retries,
-    )
-
-
-def fetch_data(
-    symbol: str,
-    period: str = DEFAULT_PERIOD,
-    retries: int = 3,
-) -> pd.DataFrame:
-    """
-    Compatibility alias for load_market_data().
-    """
-
-    return load_market_data(
-        symbol=symbol,
-        period=period,
-        retries=retries,
-    )
-
-
-# ============================================================
-# NSE QUOTE FALLBACK
+# NSE LIVE QUOTE
 # ============================================================
 
 def _nse_quote(
     symbol: str,
-) -> dict[str, float | str] | None:
+) -> dict | None:
     """
-    Get latest quote through nsepython.
+    Fetch the latest quote from NSE using nsepython.
 
-    Used as a fallback for actual OHLC requests.
+    Used as a fallback when Yahoo data is unavailable.
     """
 
     if symbol.startswith("^"):
@@ -737,14 +246,14 @@ def _nse_quote(
 
         from nsepython import nse_eq
 
-        clean = (
+        clean_symbol = (
             symbol
             .replace(".NS", "")
             .replace(".BO", "")
         )
 
         quote = nse_eq(
-            clean
+            clean_symbol
         )
 
         if (
@@ -822,6 +331,8 @@ def _nse_quote(
             ),
             "prev_close": float(
                 previous_close
+                if previous_close is not None
+                else close_price
             ),
             "source": "nse_eq",
         }
@@ -829,14 +340,318 @@ def _nse_quote(
     except Exception as error:
 
         logger.debug(
-            "NSE quote failed | "
-            "symbol=%s | "
-            "error=%s",
+            "NSE quote failed for %s: %s",
             symbol,
             error,
         )
 
         return None
+
+
+# ============================================================
+# NSE HISTORY FALLBACK
+# ============================================================
+
+def _nse_history_quiet(
+    symbol: str,
+    days: int = 30,
+) -> pd.DataFrame | None:
+    """
+    Attempt to retrieve historical NSE data.
+
+    This is a fallback only.
+    """
+
+    if symbol.startswith("^"):
+
+        return None
+
+    try:
+
+        import logging as _logging
+
+        _logging.getLogger(
+            "nsepython"
+        ).setLevel(
+            _logging.ERROR
+        )
+
+        from nsepython import equity_history
+
+        clean_symbol = (
+            symbol
+            .replace(".NS", "")
+            .replace(".BO", "")
+        )
+
+        end = datetime.now()
+
+        start = (
+            end
+            - timedelta(
+                days=days
+            )
+        )
+
+        raw = equity_history(
+            clean_symbol,
+            "EQ",
+            start.strftime(
+                "%d-%m-%Y"
+            ),
+            end.strftime(
+                "%d-%m-%Y"
+            ),
+        )
+
+        if raw is None:
+
+            return None
+
+        if isinstance(
+            raw,
+            dict,
+        ):
+
+            if (
+                "data" not in raw
+                or not raw["data"]
+            ):
+
+                return None
+
+            raw = pd.DataFrame(
+                raw["data"]
+            )
+
+        if (
+            not isinstance(
+                raw,
+                pd.DataFrame,
+            )
+            or raw.empty
+        ):
+
+            return None
+
+        column_map = {}
+
+        for column in raw.columns:
+
+            column_lower = (
+                str(column)
+                .lower()
+            )
+
+            if "open" in column_lower:
+
+                column_map[column] = "Open"
+
+            elif "high" in column_lower:
+
+                column_map[column] = "High"
+
+            elif "low" in column_lower:
+
+                column_map[column] = "Low"
+
+            elif (
+                "close" in column_lower
+                and "prev" not in column_lower
+            ):
+
+                column_map[column] = "Close"
+
+            elif "vol" in column_lower:
+
+                column_map[column] = "Volume"
+
+        frame = raw.rename(
+            columns=column_map
+        )
+
+        required = [
+            "Open",
+            "High",
+            "Low",
+            "Close",
+        ]
+
+        if not all(
+            column in frame.columns
+            for column in required
+        ):
+
+            return None
+
+        frame = frame.dropna(
+            subset=required
+        )
+
+        if frame.empty:
+
+            return None
+
+        return frame
+
+    except Exception as error:
+
+        logger.debug(
+            "NSE history failed for %s: %s",
+            symbol,
+            error,
+        )
+
+        return None
+
+
+# ============================================================
+# MARKET DATA LOADER
+# ============================================================
+
+def load_market_data(
+    symbol: str,
+    period: str = "6mo",
+    retries: int = 3,
+) -> pd.DataFrame:
+    """
+    Main market data interface.
+
+    This function is used directly by:
+
+        src.prediction_pipeline
+
+    Returns historical OHLCV data.
+
+    Priority:
+
+        1. Yahoo Finance
+        2. NSE historical data
+
+    Raises RuntimeError when no data is available.
+    """
+
+    # --------------------------------------------------------
+    # YAHOO FINANCE
+    # --------------------------------------------------------
+
+    frame = download_history(
+        symbol=symbol,
+        period=period,
+        retries=retries,
+    )
+
+    if (
+        frame is not None
+        and not frame.empty
+    ):
+
+        logger.info(
+            "Market data loaded from Yahoo | "
+            "symbol=%s | rows=%s",
+            symbol,
+            len(frame),
+        )
+
+        return frame
+
+    # --------------------------------------------------------
+    # NSE HISTORY FALLBACK
+    # --------------------------------------------------------
+
+    logger.warning(
+        "Yahoo unavailable for %s. "
+        "Trying NSE historical fallback.",
+        symbol,
+    )
+
+    frame = _nse_history_quiet(
+        symbol=symbol,
+        days=220,
+    )
+
+    if (
+        frame is not None
+        and not frame.empty
+    ):
+
+        logger.info(
+            "Market data loaded from NSE | "
+            "symbol=%s | rows=%s",
+            symbol,
+            len(frame),
+        )
+
+        return frame
+
+    # --------------------------------------------------------
+    # FAILURE
+    # --------------------------------------------------------
+
+    raise RuntimeError(
+        f"Could not load market data for {symbol} "
+        "from Yahoo Finance or NSE."
+    )
+
+
+# ============================================================
+# COMPATIBILITY ALIASES
+# ============================================================
+
+def load_data(
+    symbol: str,
+    period: str = "6mo",
+) -> pd.DataFrame:
+    """
+    Compatibility interface.
+    """
+
+    return load_market_data(
+        symbol=symbol,
+        period=period,
+    )
+
+
+def get_data(
+    symbol: str,
+    period: str = "6mo",
+) -> pd.DataFrame:
+    """
+    Compatibility interface.
+    """
+
+    return load_market_data(
+        symbol=symbol,
+        period=period,
+    )
+
+
+def fetch_data(
+    symbol: str,
+    period: str = "6mo",
+) -> pd.DataFrame:
+    """
+    Compatibility interface.
+    """
+
+    return load_market_data(
+        symbol=symbol,
+        period=period,
+    )
+
+
+def fetch_market_data(
+    symbol: str,
+    period: str = "6mo",
+) -> pd.DataFrame:
+    """
+    Compatibility interface.
+    """
+
+    return load_market_data(
+        symbol=symbol,
+        period=period,
+    )
 
 
 # ============================================================
@@ -846,22 +661,19 @@ def _nse_quote(
 def get_actual_ohlc(
     symbol: str,
     retries: int = 3,
-) -> dict[str, float | str] | None:
+) -> dict | None:
     """
-    Get the most recent OHLC data.
+    Return the latest available OHLC values.
 
-    Fallback order:
+    Priority:
 
         1. Yahoo Finance
-        2. NSE quote
+        2. NSE live quote
+        3. NSE historical data
     """
 
-    symbol = normalize_symbol(
-        symbol
-    )
-
     # --------------------------------------------------------
-    # YAHOO FINANCE
+    # YAHOO
     # --------------------------------------------------------
 
     frame = download_history(
@@ -875,61 +687,119 @@ def get_actual_ohlc(
         and not frame.empty
     ):
 
-        last = frame.iloc[-1]
-
-        if (
-            pd.notna(
-                last.get("Open")
-            )
-            and pd.notna(
-                last.get("Close")
-            )
+        if isinstance(
+            frame.columns,
+            pd.MultiIndex,
         ):
 
-            previous_close = (
-                float(
-                    frame["Close"].iloc[-2]
-                )
-                if len(frame) >= 2
-                else float(
-                    last["Close"]
-                )
+            frame.columns = (
+                frame.columns
+                .get_level_values(0)
             )
 
-            return {
-                "Open": float(
-                    last["Open"]
-                ),
-                "High": float(
-                    last["High"]
-                ),
-                "Low": float(
-                    last["Low"]
-                ),
-                "Close": float(
-                    last["Close"]
-                ),
-                "prev_close": (
-                    previous_close
-                ),
-                "source": "yfinance",
-            }
+        required = [
+            "Open",
+            "High",
+            "Low",
+            "Close",
+        ]
+
+        if all(
+            column in frame.columns
+            for column in required
+        ):
+
+            last = frame.iloc[-1]
+
+            if (
+                pd.notna(last["Close"])
+                and pd.notna(last["Open"])
+            ):
+
+                previous_close = (
+                    float(
+                        frame["Close"].iloc[-2]
+                    )
+                    if len(frame) >= 2
+                    else float(
+                        last["Close"]
+                    )
+                )
+
+                return {
+                    "Open": float(
+                        last["Open"]
+                    ),
+                    "High": float(
+                        last["High"]
+                    ),
+                    "Low": float(
+                        last["Low"]
+                    ),
+                    "Close": float(
+                        last["Close"]
+                    ),
+                    "prev_close": previous_close,
+                    "source": "yfinance",
+                }
 
     # --------------------------------------------------------
-    # NSE FALLBACK
+    # NSE LIVE QUOTE
     # --------------------------------------------------------
 
     quote = _nse_quote(
         symbol
     )
 
-    if quote is not None:
+    if quote:
 
         return quote
 
+    # --------------------------------------------------------
+    # NSE HISTORY
+    # --------------------------------------------------------
+
+    frame = _nse_history_quiet(
+        symbol=symbol,
+        days=30,
+    )
+
+    if (
+        frame is not None
+        and not frame.empty
+    ):
+
+        last = frame.iloc[-1]
+
+        previous_close = (
+            float(
+                frame["Close"].iloc[-2]
+            )
+            if len(frame) >= 2
+            else float(
+                last["Close"]
+            )
+        )
+
+        return {
+            "Open": float(
+                last["Open"]
+            ),
+            "High": float(
+                last["High"]
+            ),
+            "Low": float(
+                last["Low"]
+            ),
+            "Close": float(
+                last["Close"]
+            ),
+            "prev_close": previous_close,
+            "source": "nsepython",
+        }
+
     logger.error(
-        "No actual OHLC data available "
-        "for %s",
+        "No actual data available for %s",
         symbol,
     )
 
@@ -937,36 +807,51 @@ def get_actual_ohlc(
 
 
 # ============================================================
-# ADDITIONAL COMPATIBILITY ALIASES
+# CLI TEST
 # ============================================================
 
-def fetch_market_data(
-    symbol: str,
-    period: str = DEFAULT_PERIOD,
-    retries: int = 3,
-) -> pd.DataFrame:
-    """
-    Compatibility alias.
-    """
+if __name__ == "__main__":
 
-    return load_market_data(
-        symbol=symbol,
-        period=period,
-        retries=retries,
+    logging.basicConfig(
+        level=logging.INFO,
+        format=(
+            "%(asctime)s | "
+            "%(levelname)s | "
+            "%(name)s | "
+            "%(message)s"
+        ),
     )
 
+    test_symbol = "RELIANCE.NS"
 
-def get_history(
-    symbol: str,
-    period: str = DEFAULT_PERIOD,
-    retries: int = 3,
-) -> pd.DataFrame:
-    """
-    Compatibility alias.
-    """
+    print()
 
-    return load_market_data(
-        symbol=symbol,
-        period=period,
-        retries=retries,
-    )
+    print("=" * 70)
+    print("MARKET DATA LOADER TEST")
+    print("=" * 70)
+
+    try:
+
+        data = load_market_data(
+            test_symbol
+        )
+
+        print(
+            f"Symbol: {test_symbol}"
+        )
+
+        print(
+            f"Rows: {len(data)}"
+        )
+
+        print()
+
+        print(
+            data.tail().to_string()
+        )
+
+    except Exception as error:
+
+        print(
+            f"FAILED: {error}"
+        )
