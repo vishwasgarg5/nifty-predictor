@@ -38,6 +38,9 @@ paths:
   # Logs
   logs: logs
 
+  # Champion / Challenger registry
+  model_registry: data/model_registry.json
+
 
 # ============================================================
 # UNIVERSE
@@ -45,15 +48,9 @@ paths:
 
 universes:
 
-  # Primary universes used by the morning pipeline.
-  #
-  # Adjust these names to match the universe names supported
-  # by your existing src/universe.py implementation.
-
   primary:
     - nifty50
 
-  # Optional additional universes.
   secondary:
     - niftynext50
 
@@ -75,25 +72,18 @@ data:
   yahoo:
 
     enabled: true
-
     period: 1y
-
     interval: 1d
-
     auto_adjust: false
 
   nse:
 
     enabled: true
-
     validate_symbols: true
 
   retries: 3
-
   retry_delay_seconds: 2
-
   timeout_seconds: 20
-
   cache_enabled: true
 
 
@@ -104,19 +94,12 @@ data:
 validation:
 
   enabled: true
-
   minimum_history_days: 120
-
   minimum_latest_price: 1.0
-
   allow_missing_volume: false
-
   maximum_missing_ratio: 0.05
-
   reject_duplicate_dates: true
-
   reject_negative_prices: true
-
   reject_invalid_ohlc: true
 
 
@@ -128,23 +111,18 @@ market_regime:
 
   enabled: true
 
-  # Yahoo Finance NSE Nifty 50 symbol
   symbol: "^NSEI"
 
   period: 1y
 
   fast_ma: 20
-
   slow_ma: 50
-
   long_ma: 200
 
   volatility_window: 20
 
   trend_threshold: 0.02
-
   volatility_threshold: 0.03
-
   confidence_threshold: 0.50
 
 
@@ -157,25 +135,19 @@ technical:
   enabled: true
 
   sma_short: 20
-
   sma_medium: 50
-
   sma_long: 200
 
   ema_short: 12
-
   ema_long: 26
 
   rsi_period: 14
 
   macd_fast: 12
-
   macd_slow: 26
-
   macd_signal: 9
 
   atr_period: 14
-
   volume_window: 20
 
 
@@ -188,13 +160,9 @@ fundamental:
   enabled: true
 
   use_pe_ratio: true
-
   use_market_cap: true
-
   use_profitability: true
-
   use_revenue_growth: true
-
   use_debt: true
 
   minimum_market_cap: 0
@@ -209,15 +177,11 @@ sentiment:
   enabled: true
 
   max_articles: 10
-
   lookback_days: 3
-
   minimum_articles: 1
 
   positive_threshold: 0.15
-
   negative_threshold: -0.15
-
   neutral_threshold: 0.05
 
 
@@ -232,13 +196,10 @@ features:
   history_period: 1y
 
   minimum_history_rows: 120
-
   minimum_quality_score: 0.85
 
   drop_rows_with_nan: true
-
   replace_infinity: true
-
   normalize_features: true
 
   feature_version: "v1"
@@ -252,12 +213,7 @@ ml:
 
   enabled: true
 
-  # ----------------------------------------------------------
-  # TRAINING
-  # ----------------------------------------------------------
-
   training_period: 5y
-
   training_limit: 5
 
   minimum_training_rows: 150
@@ -265,23 +221,12 @@ ml:
   retrain_enabled: true
 
   random_state: 42
-
   n_jobs: -1
 
-  # ----------------------------------------------------------
-  # PREDICTION
-  # ----------------------------------------------------------
-
   prediction_horizon_days: 1
-
   prediction_period: 1y
 
-  # ----------------------------------------------------------
-  # DATA SPLIT
-  # ----------------------------------------------------------
-
   test_size: 0.20
-
   validation_size: 0.10
 
   shuffle_training_data: false
@@ -298,11 +243,8 @@ return_model:
   algorithm: random_forest
 
   n_estimators: 300
-
   max_depth: 8
-
   min_samples_split: 5
-
   min_samples_leaf: 2
 
 
@@ -317,11 +259,8 @@ direction_model:
   algorithm: random_forest
 
   n_estimators: 300
-
   max_depth: 8
-
   min_samples_split: 5
-
   min_samples_leaf: 2
 
   probability_threshold: 0.50
@@ -338,11 +277,8 @@ risk_model:
   algorithm: random_forest
 
   n_estimators: 250
-
   max_depth: 8
-
   min_samples_split: 5
-
   min_samples_leaf: 2
 
 
@@ -355,9 +291,7 @@ ensemble:
   enabled: true
 
   return_weight: 0.40
-
   direction_weight: 0.35
-
   risk_weight: 0.25
 
   normalize_outputs: true
@@ -374,9 +308,7 @@ confidence:
   minimum_confidence: 0.20
 
   high_confidence: 0.75
-
   medium_confidence: 0.50
-
   low_confidence: 0.20
 
 
@@ -389,11 +321,8 @@ opportunity:
   enabled: true
 
   return_weight: 0.40
-
   probability_weight: 0.30
-
   risk_weight: 0.20
-
   confidence_weight: 0.10
 
   minimum_score: 0.20
@@ -407,15 +336,11 @@ scoring:
 
   enabled: true
 
-  # Number of stocks selected before ML inference.
   prefilter_top: 40
 
   technical_weight: 0.25
-
   opportunity_weight: 0.40
-
   confidence_weight: 0.20
-
   feature_quality_weight: 0.15
 
   minimum_score: 0.20
@@ -430,9 +355,7 @@ quality_gate:
   enabled: true
 
   minimum_feature_quality: 0.85
-
   minimum_confidence: 0.20
-
   minimum_opportunity_score: 0.20
 
   reject_missing_prediction: true
@@ -447,7 +370,6 @@ diversification:
   enabled: true
 
   max_per_sector: 2
-
   max_per_industry: 2
 
   unknown_sector_allowed: true
@@ -469,11 +391,9 @@ ohlc:
   enabled: true
 
   prediction_horizon_days: 1
-
   minimum_history_days: 60
 
   validate_prediction: true
-
   require_valid_range: true
 
 
@@ -486,25 +406,17 @@ ledger:
   enabled: true
 
   store_current_close: true
-
   store_market_regime: true
-
   store_model_version: true
-
   store_feature_version: true
-
   store_confidence: true
-
   store_opportunity_score: true
-
   store_probability: true
-
   store_risk: true
 
   evaluation_status_column: evaluation_status
 
   pending_status: PENDING
-
   evaluated_status: EVALUATED
 
 
@@ -516,22 +428,15 @@ evaluation:
 
   enabled: true
 
-  # Evaluate predictions only after the market has closed.
   evaluation_hour: 16
 
-  # Number of recent evaluated records included in reports.
   recent_window: 50
 
   calculate_return_mae: true
-
   calculate_direction_accuracy: true
-
   calculate_brier_score: true
-
   calculate_probability_error: true
-
   calculate_risk_mae: true
-
   calculate_ohlc_mae: true
 
   save_reports: true
@@ -545,53 +450,26 @@ drift:
 
   enabled: true
 
-  # Recent predictions used for short-term performance.
   recent_window: 20
 
-  # Older predictions required for baseline comparison.
   minimum_history: 30
 
-  # Maximum historical observations used for baseline.
   maximum_baseline_multiplier: 5
 
-  # ----------------------------------------------------------
-  # PERFORMANCE DETERIORATION THRESHOLDS
-  # ----------------------------------------------------------
-
-  # 30% relative increase in Return MAE.
   return_mae_threshold: 0.30
-
-  # 10 percentage-point drop in direction accuracy.
   direction_accuracy_threshold: 0.10
-
-  # 20% relative increase in Brier score.
   brier_score_threshold: 0.20
-
-  # 30% relative increase in Risk MAE.
   risk_mae_threshold: 0.30
 
-  # ----------------------------------------------------------
-  # DRIFT SCORE LEVELS
-  # ----------------------------------------------------------
-
   warning_threshold: 1.0
-
   drift_threshold: 2.0
-
   critical_threshold: 3.0
 
-  # ----------------------------------------------------------
-  # ACTIONS
-  # ----------------------------------------------------------
-
   notify_on_warning: false
-
   notify_on_drift: true
-
   notify_on_critical: true
 
   recommend_retraining: true
-
   enable_challenger: true
 
 
@@ -603,30 +481,67 @@ champion_challenger:
 
   enabled: true
 
-  # Current production model.
   champion: current
 
-  # Challenger model name/version.
   challenger: challenger_v1
 
   minimum_evaluations: 30
 
   comparison_window: 50
 
-  # Challenger must outperform champion by this amount.
   minimum_improvement: 0.02
 
   evaluate_return_mae: true
-
   evaluate_direction_accuracy: true
-
   evaluate_brier_score: true
-
   evaluate_risk_mae: true
 
   auto_promote: false
 
   require_manual_approval: true
+
+
+# ============================================================
+# AUTOMATIC RETRAINING
+# ============================================================
+
+retraining:
+
+  enabled: true
+
+  retrain_on_warning: false
+
+  retrain_on_drift: true
+
+  retrain_on_critical: true
+
+  challenger_prefix: challenger
+
+  training_timeout_seconds: 7200
+
+
+# ============================================================
+# PARALLEL PREDICTION
+# ============================================================
+
+parallel_prediction:
+
+  enabled: true
+
+  registry_path: data/model_registry.json
+
+  # Champion predictions are handled by morning_job.py
+  run_champion: false
+
+  # Challenger models run in shadow mode
+  run_challengers: true
+
+  champion_name: current
+
+  # Run only the newest active Challenger
+  max_active_challengers: 1
+
+  ledger_path: data/ledger/predictions.csv
 
 
 # ============================================================
@@ -640,11 +555,8 @@ model_store:
   path: data/models
 
   save_metadata: true
-
   save_training_metrics: true
-
   save_feature_version: true
-
   save_training_timestamp: true
 
   overwrite_existing: true
@@ -661,7 +573,6 @@ training:
   full_retrain_days: 30
 
   retrain_on_drift: true
-
   retrain_on_critical_drift: true
 
   minimum_days_between_retraining: 7
@@ -696,7 +607,6 @@ ipo:
   enabled: true
 
   include_upcoming: true
-
   include_recent_listings: true
 
   maximum_items: 5
@@ -713,11 +623,8 @@ telegram:
   parse_mode: Markdown
 
   send_predictions: true
-
   send_evaluation_report: false
-
   send_drift_warning: true
-
   send_training_status: true
 
   max_message_length: 4000
@@ -734,7 +641,6 @@ schedule:
     enabled: true
 
     hour: 8
-
     minute: 0
 
   evaluation_job:
@@ -742,7 +648,6 @@ schedule:
     enabled: true
 
     hour: 16
-
     minute: 0
 
   drift_job:
@@ -750,7 +655,6 @@ schedule:
     enabled: true
 
     hour: 16
-
     minute: 15
 
   training_job:
@@ -760,7 +664,6 @@ schedule:
     day_of_week: sunday
 
     hour: 10
-
     minute: 0
 
 
@@ -790,9 +693,7 @@ debug:
   enabled: false
 
   log_feature_columns: false
-
   log_model_predictions: false
-
   log_raw_data: false
 
   save_intermediate_results: false
