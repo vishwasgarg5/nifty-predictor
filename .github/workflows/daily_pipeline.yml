@@ -1,84 +1,157 @@
 name: Daily Stock Prediction Pipeline
 
 on:
+
   workflow_dispatch:
 
   schedule:
-    # Morning prediction job.
-    # 03:30 UTC = 09:00 IST
+
+    # Morning prediction job
+    # 09:00 IST
     - cron: "30 3 * * 1-5"
 
-    # Evening evaluation job.
-    # 11:30 UTC = 17:00 IST
+    # Evening evaluation job
+    # 17:00 IST
     - cron: "30 11 * * 1-5"
+
 
 permissions:
   contents: write
 
+
 concurrency:
-  group: daily-stock-pipeline
+
+  group: stock-prediction-pipeline
+
   cancel-in-progress: false
+
 
 jobs:
 
-  morning-predictions:
+  morning-prediction:
 
-    name: Morning Predictions
-
-    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '30 3 * * 1-5'
+    name: Morning Prediction Pipeline
 
     runs-on: ubuntu-latest
 
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '30 3 * * 1-5'
+
     timeout-minutes: 30
 
+
     steps:
+
+      # --------------------------------------------------------
+      # CHECKOUT
+      # --------------------------------------------------------
 
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+
+      # --------------------------------------------------------
+      # PYTHON
+      # --------------------------------------------------------
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Upgrade pip
-        run: |
-          python -m pip install --upgrade pip
+
+      # --------------------------------------------------------
+      # CACHE
+      # --------------------------------------------------------
+
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+
+      # --------------------------------------------------------
+      # INSTALL
+      # --------------------------------------------------------
 
       - name: Install dependencies
         run: |
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            echo "requirements.txt not found"
-            exit 1
-          fi
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+
+      # --------------------------------------------------------
+      # CREATE DIRECTORIES
+      # --------------------------------------------------------
 
       - name: Create required directories
         run: |
-          mkdir -p data/ledger
-          mkdir -p data/reports
+          mkdir -p data/predictions
+          mkdir -p data/history
           mkdir -p data/models
+          mkdir -p data/universes
+          mkdir -p data/reports
+          mkdir -p data/monitoring
+          mkdir -p data/ledger
+          mkdir -p data/ipo
           mkdir -p logs
+
+
+      # --------------------------------------------------------
+      # RUN MORNING JOB
+      # --------------------------------------------------------
 
       - name: Run morning prediction job
         env:
-          PYTHONPATH: .
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python scripts/morning_job.py
 
-      - name: Commit prediction ledger and reports
+
+      # --------------------------------------------------------
+      # UPLOAD ARTIFACTS
+      # --------------------------------------------------------
+
+      - name: Upload morning artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: morning-pipeline-${{ github.run_id }}
+          path: |
+            data/predictions/
+            data/ledger/
+            data/reports/
+            data/monitoring/
+            data/model_registry.json
+            logs/
+          if-no-files-found: warn
+          retention-days: 30
+
+
+      # --------------------------------------------------------
+      # COMMIT RESULTS
+      # --------------------------------------------------------
+
+      - name: Commit morning pipeline results
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add \
+            data/predictions/ \
+            data/history/ \
+            data/models/ \
+            data/universes/ \
             data/ledger/ \
             data/reports/ \
+            data/monitoring/ \
+            data/ipo/ \
             data/model_registry.json \
             logs/ || true
 
@@ -89,92 +162,95 @@ jobs:
             git push
           fi
 
-      - name: Upload morning job artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: morning-job-${{ github.run_id }}
-          path: |
-            data/ledger/
-            data/reports/
-            logs/
-          if-no-files-found: warn
-          retention-days: 14
-
 
   evening-evaluation:
 
-    name: Evening Evaluation
-
-    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '30 11 * * 1-5'
+    name: Evening Evaluation Pipeline
 
     runs-on: ubuntu-latest
 
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '30 11 * * 1-5'
+
     timeout-minutes: 30
 
+
     steps:
+
+      # --------------------------------------------------------
+      # CHECKOUT
+      # --------------------------------------------------------
 
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+
+      # --------------------------------------------------------
+      # PYTHON
+      # --------------------------------------------------------
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Upgrade pip
-        run: |
-          python -m pip install --upgrade pip
+
+      # --------------------------------------------------------
+      # CACHE
+      # --------------------------------------------------------
+
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+
+      # --------------------------------------------------------
+      # INSTALL
+      # --------------------------------------------------------
 
       - name: Install dependencies
         run: |
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            echo "requirements.txt not found"
-            exit 1
-          fi
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+
+      # --------------------------------------------------------
+      # CREATE DIRECTORIES
+      # --------------------------------------------------------
 
       - name: Create required directories
         run: |
-          mkdir -p data/ledger
-          mkdir -p data/reports
+          mkdir -p data/predictions
+          mkdir -p data/history
           mkdir -p data/models
+          mkdir -p data/universes
+          mkdir -p data/reports
+          mkdir -p data/monitoring
+          mkdir -p data/ledger
+          mkdir -p data/ipo
           mkdir -p logs
 
-      - name: Run evaluation job
+
+      # --------------------------------------------------------
+      # RUN EVALUATION JOB
+      # --------------------------------------------------------
+
+      - name: Run evening evaluation job
         env:
-          PYTHONPATH: .
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python scripts/evaluation_job.py
 
-      - name: Run Champion Challenger comparison
-        env:
-          PYTHONPATH: .
-        run: |
-          python src/champion_challenger.py || true
 
-      - name: Commit evaluation results
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add \
-            data/ledger/ \
-            data/reports/ \
-            data/model_registry.json \
-            logs/ || true
-
-          if git diff --cached --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "Automated model evaluation [skip ci]"
-            git push
-          fi
+      # --------------------------------------------------------
+      # UPLOAD ARTIFACTS
+      # --------------------------------------------------------
 
       - name: Upload evaluation artifacts
         if: always()
@@ -184,7 +260,33 @@ jobs:
           path: |
             data/ledger/
             data/reports/
+            data/monitoring/
             data/model_registry.json
             logs/
           if-no-files-found: warn
           retention-days: 30
+
+
+      # --------------------------------------------------------
+      # COMMIT RESULTS
+      # --------------------------------------------------------
+
+      - name: Commit evaluation and monitoring results
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            data/ledger/ \
+            data/reports/ \
+            data/monitoring/ \
+            data/model_registry.json \
+            logs/ || true
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Automated evaluation and monitoring [skip ci]"
+            git push
+          fi
