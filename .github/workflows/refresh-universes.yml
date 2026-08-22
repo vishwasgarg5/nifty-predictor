@@ -2,7 +2,7 @@ name: Refresh Universe Lists
 
 on:
   schedule:
-    # Every Saturday 03:00 UTC ≈ 08:30 IST
+    # Saturday ~08:30 IST
     - cron: '0 3 * * 6'
   workflow_dispatch:
 
@@ -14,30 +14,27 @@ jobs:
       contents: write
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
       - name: Install deps
         run: |
-          pip install --upgrade pip
           pip install pandas requests pyyaml python-dotenv
 
       - name: Create folders
         run: mkdir -p data/universes
 
-      - name: Refresh Nifty 50/100/500/Midcap lists
+      - name: Refresh Nifty lists
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python scripts/build_universes.py
 
-      - name: Commit updated CSVs
+      - name: Commit CSVs
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "data: refresh nifty universe lists"
