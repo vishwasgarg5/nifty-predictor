@@ -11,6 +11,7 @@ indexes:
     - {symbol: "^NSEI", name: "NIFTY50"}
     - {symbol: "^BSESN", name: "SENSEX"}
     - {symbol: "^NSEBANK", name: "BANKNIFTY"}
+    - {symbol: "^CNXIT", name: "NIFTY_IT"}
 
 ipo_desk:
   enabled: true
