@@ -4,23 +4,20 @@
 Actual Market Outcome Resolver.
 
 This module evaluates past predictions by fetching historical
-market prices and calculating actual outcomes.
+market prices and calculating actual market outcomes.
 
-Evaluation flow
----------------
+Pipeline
+--------
 Prediction Ledger
        │
        ▼
-Read prediction_id / symbol / market_date
+Find prediction symbol
        │
        ▼
-Determine prediction trading session
+Determine prediction trading date
        │
        ▼
-Calculate evaluation target date
-       │
-       ▼
-Wait for required market session to complete
+Determine evaluation trading date
        │
        ▼
 Fetch historical market prices
@@ -32,7 +29,7 @@ Determine entry price
 Determine evaluation price
        │
        ▼
-Calculate actual outcome
+Calculate actual return
        │
        ├── actual_return
        ├── actual_direction
@@ -41,14 +38,6 @@ Calculate actual outcome
        │
        ▼
 Return evaluated DataFrame
-
-Important
----------
-The resolver does not evaluate predictions merely because a
-calendar-day horizon has passed.
-
-A prediction is evaluated only when the required target trading
-session has historical close data available.
 
 The evaluation job calls:
 
@@ -63,7 +52,7 @@ from __future__ import annotations
 
 import logging
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -98,7 +87,7 @@ logger = logging.getLogger("actuals")
 
 
 # ============================================================
-# CONFIG HELPERS
+# CONFIG
 # ============================================================
 
 def object_to_dict(
@@ -160,21 +149,17 @@ def get_evaluation_config() -> dict[str, Any]:
             horizon_days: 1
             price_source: yahoo
 
-    horizon_days means the number of calendar days after the
-    prediction market date at which evaluation becomes eligible.
-    The actual exit price is selected from the first available
-    trading session on or after that target date.
+    Defaults are used when unavailable.
     """
 
     cfg = load_config()
 
-    defaults = {
-        "horizon_days": 1,
-        "price_source": "yahoo",
-    }
-
     if cfg is None:
-        return defaults
+
+        return {
+            "horizon_days": 1,
+            "price_source": "yahoo",
+        }
 
     section = getattr(
         cfg,
@@ -188,7 +173,7 @@ def get_evaluation_config() -> dict[str, Any]:
 
     horizon_days = values.get(
         "horizon_days",
-        defaults["horizon_days"],
+        1,
     )
 
     try:
@@ -199,9 +184,7 @@ def get_evaluation_config() -> dict[str, Any]:
 
     except Exception:
 
-        horizon_days = defaults[
-            "horizon_days"
-        ]
+        horizon_days = 1
 
     return {
         "horizon_days": max(
@@ -210,7 +193,7 @@ def get_evaluation_config() -> dict[str, Any]:
         ),
         "price_source": values.get(
             "price_source",
-            defaults["price_source"],
+            "yahoo",
         ),
     }
 
@@ -220,36 +203,22 @@ def get_evaluation_config() -> dict[str, Any]:
 # ============================================================
 
 def utc_now() -> datetime:
-    """Return current UTC datetime."""
+    """Return the current UTC datetime."""
 
     return datetime.now(
         timezone.utc
     )
 
 
-def utc_now_iso() -> str:
-    """Return current UTC time as ISO text."""
-
-    return utc_now().isoformat()
-
-
 def parse_datetime(
     value: Any,
 ) -> datetime | None:
     """
-    Parse a date or datetime value safely.
+    Parse a date/datetime value safely.
     """
 
     if value is None:
         return None
-
-    try:
-
-        if pd.isna(value):
-            return None
-
-    except Exception:
-        pass
 
     if isinstance(
         value,
@@ -275,6 +244,7 @@ def parse_datetime(
         )
 
         if pd.isna(parsed):
+
             return None
 
         return parsed.to_pydatetime()
@@ -284,46 +254,16 @@ def parse_datetime(
         return None
 
 
-def parse_market_date(
-    value: Any,
-) -> datetime | None:
-    """
-    Parse a market date.
-
-    The returned value is normalized to midnight UTC.
-
-    Examples:
-
-        2026-08-22
-        2026-08-22T04:30:00+00:00
-    """
-
-    parsed = parse_datetime(
-        value
-    )
-
-    if parsed is None:
-        return None
-
-    return datetime(
-        year=parsed.year,
-        month=parsed.month,
-        day=parsed.day,
-        tzinfo=timezone.utc,
-    )
-
-
-def normalize_datetime_to_date(
+def datetime_to_date(
     value: datetime,
-) -> datetime:
-    """Normalize a datetime to midnight UTC."""
+) -> date:
+    """
+    Convert a datetime into a calendar date.
+    """
 
-    return datetime(
-        year=value.year,
-        month=value.month,
-        day=value.day,
-        tzinfo=timezone.utc,
-    )
+    return value.astimezone(
+        timezone.utc
+    ).date()
 
 
 # ============================================================
@@ -334,7 +274,7 @@ def normalize_symbol(
     symbol: Any,
 ) -> str:
     """
-    Normalize a symbol for Yahoo Finance.
+    Normalize symbols for Yahoo Finance.
 
     Examples:
 
@@ -348,14 +288,6 @@ def normalize_symbol(
 
     if symbol is None:
         return ""
-
-    try:
-
-        if pd.isna(symbol):
-            return ""
-
-    except Exception:
-        pass
 
     value = str(
         symbol
@@ -379,17 +311,17 @@ def normalize_symbol(
 
 def fetch_historical_prices(
     symbol: str,
-    start: datetime,
-    end: datetime,
+    start_date: date,
+    end_date: date,
 ) -> pd.DataFrame:
     """
-    Fetch historical prices from Yahoo Finance.
+    Fetch historical daily prices from Yahoo Finance.
 
-    The date range includes a buffer before and after the
-    requested period so the resolver can handle weekends,
-    holidays, and missing sessions.
+    Important:
 
-    Returns a DataFrame containing historical OHLCV data.
+    Yahoo's end date is effectively exclusive.
+
+    Therefore we request extra calendar days on both sides.
     """
 
     try:
@@ -403,36 +335,32 @@ def fetch_historical_prices(
             "actual outcome evaluation."
         ) from error
 
+    request_start = (
+        start_date
+        - timedelta(days=7)
+    )
+
+    request_end = (
+        end_date
+        + timedelta(days=8)
+    )
+
+    logger.info(
+        "Fetching prices for %s | %s -> %s",
+        symbol,
+        request_start,
+        request_end,
+    )
+
     ticker = yf.Ticker(
         symbol
     )
 
-    start_date = (
-        normalize_datetime_to_date(
-            start
-        )
-        - timedelta(days=10)
-    ).date()
-
-    end_date = (
-        normalize_datetime_to_date(
-            end
-        )
-        + timedelta(days=10)
-    ).date()
-
-    logger.info(
-        "Fetching prices | symbol=%s | "
-        "start=%s | end=%s",
-        symbol,
-        start_date,
-        end_date,
-    )
-
     frame = ticker.history(
-        start=start_date,
-        end=end_date,
+        start=request_start.isoformat(),
+        end=request_end.isoformat(),
         auto_adjust=False,
+        actions=False,
     )
 
     if frame is None or frame.empty:
@@ -443,7 +371,6 @@ def fetch_historical_prices(
 
     frame.index = pd.to_datetime(
         frame.index,
-        utc=True,
         errors="coerce",
     )
 
@@ -451,12 +378,22 @@ def fetch_historical_prices(
         ~frame.index.isna()
     ]
 
+    if frame.empty:
+
+        return pd.DataFrame()
+
+    if frame.index.tz is not None:
+
+        frame.index = frame.index.tz_localize(
+            None
+        )
+
+    frame = frame.sort_index()
+
     frame = frame.dropna(
         axis=0,
         how="all",
     )
-
-    frame = frame.sort_index()
 
     return frame
 
@@ -469,7 +406,7 @@ def get_price_column(
     frame: pd.DataFrame,
 ) -> str | None:
     """
-    Select the preferred closing price column.
+    Select the preferred price column.
     """
 
     for column in [
@@ -478,149 +415,27 @@ def get_price_column(
     ]:
 
         if column in frame.columns:
+
             return column
 
     return None
 
 
 # ============================================================
-# TRADING DATE HELPERS
+# TRADING DATE SELECTION
 # ============================================================
 
-def get_trading_dates(
+def select_price_on_or_after_date(
     prices: pd.DataFrame,
-) -> list[datetime]:
-    """
-    Return unique available trading dates.
-
-    Dates are normalized to midnight UTC.
-    """
-
-    if prices.empty:
-        return []
-
-    dates: list[datetime] = []
-
-    seen: set[str] = set()
-
-    for timestamp in prices.index:
-
-        try:
-
-            value = pd.Timestamp(
-                timestamp
-            )
-
-            if value.tzinfo is None:
-
-                value = value.tz_localize(
-                    "UTC"
-                )
-
-            else:
-
-                value = value.tz_convert(
-                    "UTC"
-                )
-
-            normalized = datetime(
-                year=value.year,
-                month=value.month,
-                day=value.day,
-                tzinfo=timezone.utc,
-            )
-
-            key = normalized.strftime(
-                "%Y-%m-%d"
-            )
-
-            if key not in seen:
-
-                seen.add(key)
-
-                dates.append(
-                    normalized
-                )
-
-        except Exception:
-            continue
-
-    return sorted(
-        dates
-    )
-
-
-def select_first_trading_date_on_or_after(
-    prices: pd.DataFrame,
-    target_date: datetime,
-) -> datetime | None:
-    """
-    Return the first available trading date on or after
-    target_date.
-    """
-
-    normalized_target = (
-        normalize_datetime_to_date(
-            target_date
-        )
-    )
-
-    for trading_date in get_trading_dates(
-        prices
-    ):
-
-        if trading_date >= normalized_target:
-
-            return trading_date
-
-    return None
-
-
-def select_last_trading_date_on_or_before(
-    prices: pd.DataFrame,
-    target_date: datetime,
-) -> datetime | None:
-    """
-    Return the last available trading date on or before
-    target_date.
-    """
-
-    normalized_target = (
-        normalize_datetime_to_date(
-            target_date
-        )
-    )
-
-    selected = None
-
-    for trading_date in get_trading_dates(
-        prices
-    ):
-
-        if trading_date <= normalized_target:
-
-            selected = trading_date
-
-        else:
-
-            break
-
-    return selected
-
-
-# ============================================================
-# PRICE SELECTION
-# ============================================================
-
-def select_price_for_trading_date(
-    prices: pd.DataFrame,
-    trading_date: datetime,
+    target_date: date,
 ) -> tuple[float | None, datetime | None]:
     """
-    Select the closing price for a specific trading date.
+    Select the first available market close on or after
+    the target date.
     """
 
     if prices.empty:
+
         return None, None
 
     price_column = get_price_column(
@@ -628,102 +443,103 @@ def select_price_for_trading_date(
     )
 
     if price_column is None:
+
         return None, None
 
-    normalized_date = (
-        normalize_datetime_to_date(
-            trading_date
-        )
+    target = pd.Timestamp(
+        target_date
     )
 
-    target_day = normalized_date.date()
-
-    selected_rows = prices.loc[
-        prices.index.date == target_day
+    eligible = prices.loc[
+        prices.index >= target
     ]
 
-    if selected_rows.empty:
+    if eligible.empty:
+
         return None, None
 
-    row = selected_rows.iloc[-1]
+    row = eligible.iloc[0]
 
-    value = pd.to_numeric(
-        row.get(
-            price_column
-        ),
-        errors="coerce",
+    value = row.get(
+        price_column
     )
 
-    if pd.isna(value):
+    try:
+
+        value = float(value)
+
+    except Exception:
+
         return None, None
 
-    timestamp = selected_rows.index[-1]
+    if pd.isna(value) or value <= 0:
+
+        return None, None
+
+    timestamp = eligible.index[0]
 
     return (
-        float(value),
+        value,
         timestamp.to_pydatetime(),
     )
 
 
-def select_price_on_or_after(
+def select_price_on_or_before_date(
     prices: pd.DataFrame,
-    target_time: datetime,
+    target_date: date,
 ) -> tuple[float | None, datetime | None]:
     """
-    Select the first available trading session close
-    on or after the target date.
+    Select the last available market close on or before
+    the target date.
     """
 
-    target_date = (
-        normalize_datetime_to_date(
-            target_time
-        )
-    )
+    if prices.empty:
 
-    trading_date = (
-        select_first_trading_date_on_or_after(
-            prices,
-            target_date,
-        )
-    )
-
-    if trading_date is None:
         return None, None
 
-    return select_price_for_trading_date(
-        prices,
-        trading_date,
+    price_column = get_price_column(
+        prices
     )
 
+    if price_column is None:
 
-def select_price_on_or_before(
-    prices: pd.DataFrame,
-    target_time: datetime,
-) -> tuple[float | None, datetime | None]:
-    """
-    Select the last available trading session close
-    on or before the target date.
-    """
-
-    target_date = (
-        normalize_datetime_to_date(
-            target_time
-        )
-    )
-
-    trading_date = (
-        select_last_trading_date_on_or_before(
-            prices,
-            target_date,
-        )
-    )
-
-    if trading_date is None:
         return None, None
 
-    return select_price_for_trading_date(
-        prices,
-        trading_date,
+    target = pd.Timestamp(
+        target_date
+    )
+
+    eligible = prices.loc[
+        prices.index <= target
+    ]
+
+    if eligible.empty:
+
+        return None, None
+
+    row = eligible.iloc[-1]
+
+    value = row.get(
+        price_column
+    )
+
+    try:
+
+        value = float(value)
+
+    except Exception:
+
+        return None, None
+
+    if pd.isna(value) or value <= 0:
+
+        return None, None
+
+    timestamp = eligible.index[-1]
+
+    return (
+        value,
+        timestamp.to_pydatetime(),
     )
 
 
@@ -735,9 +551,7 @@ def find_first_value(
     row: pd.Series,
     candidates: list[str],
 ) -> Any:
-    """
-    Return the first non-empty value from candidate columns.
-    """
+    """Return the first available non-null value."""
 
     for column in candidates:
 
@@ -748,53 +562,18 @@ def find_first_value(
             column
         )
 
-        try:
+        if pd.notna(value):
 
-            if pd.isna(value):
-                continue
-
-        except Exception:
-            pass
-
-        if isinstance(
-            value,
-            str,
-        ) and not value.strip():
-
-            continue
-
-        return value
+            return value
 
     return None
-
-
-def get_prediction_id(
-    row: pd.Series,
-) -> str | None:
-    """Get prediction_id when available."""
-
-    value = find_first_value(
-        row,
-        [
-            "prediction_id",
-        ],
-    )
-
-    if value is None:
-        return None
-
-    result = str(
-        value
-    ).strip()
-
-    return result or None
 
 
 def get_prediction_timestamp(
     row: pd.Series,
 ) -> datetime | None:
     """
-    Get the original prediction timestamp.
+    Get the prediction timestamp.
     """
 
     value = find_first_value(
@@ -812,41 +591,10 @@ def get_prediction_timestamp(
     )
 
 
-def get_prediction_market_date(
-    row: pd.Series,
-) -> datetime | None:
-    """
-    Determine the market date for the prediction.
-
-    Priority:
-
-        1. market_date
-        2. prediction_date
-        3. created_at
-        4. timestamp
-        5. date
-    """
-
-    value = find_first_value(
-        row,
-        [
-            "market_date",
-            "prediction_date",
-            "created_at",
-            "timestamp",
-            "date",
-        ],
-    )
-
-    return parse_market_date(
-        value
-    )
-
-
 def get_prediction_symbol(
     row: pd.Series,
 ) -> str:
-    """Get stock symbol."""
+    """Get and normalize the prediction symbol."""
 
     value = find_first_value(
         row,
@@ -868,7 +616,7 @@ def get_entry_price(
     """
     Get the recorded prediction entry price.
 
-    If unavailable, historical market data is used.
+    Historical data is used when no valid entry price exists.
     """
 
     value = find_first_value(
@@ -883,6 +631,7 @@ def get_entry_price(
     )
 
     if value is None:
+
         return None
 
     try:
@@ -891,7 +640,12 @@ def get_entry_price(
             value
         )
 
+        if pd.isna(numeric):
+
+            return None
+
         if numeric <= 0:
+
             return None
 
         return numeric
@@ -899,66 +653,6 @@ def get_entry_price(
     except Exception:
 
         return None
-
-
-# ============================================================
-# EVALUATION DATE
-# ============================================================
-
-def calculate_evaluation_target_date(
-    prediction_market_date: datetime,
-    horizon_days: int,
-) -> datetime:
-    """
-    Calculate the earliest date eligible for evaluation.
-
-    Example:
-
-        prediction market date = Monday
-        horizon_days = 1
-
-        target = Tuesday
-
-    If the target is a weekend or holiday, the resolver uses
-    the first actual trading session on or after this date.
-    """
-
-    return (
-        normalize_datetime_to_date(
-            prediction_market_date
-        )
-        + timedelta(
-            days=max(
-                1,
-                int(horizon_days),
-            )
-        )
-    )
-
-
-def target_horizon_reached(
-    target_date: datetime,
-) -> bool:
-    """
-    Check whether the target calendar date has been reached.
-
-    This does not itself mean the market close is available.
-    Historical price availability is checked separately.
-    """
-
-    now_date = (
-        normalize_datetime_to_date(
-            utc_now()
-        )
-    )
-
-    normalized_target = (
-        normalize_datetime_to_date(
-            target_date
-        )
-    )
-
-    return now_date >= normalized_target
 
 
 # ============================================================
@@ -981,6 +675,12 @@ def calculate_actual_return(
             "Entry price must be greater than zero."
         )
 
+    if exit_price <= 0:
+
+        raise ValueError(
+            "Exit price must be greater than zero."
+        )
+
     return (
         (
             exit_price
@@ -994,12 +694,16 @@ def calculate_actual_return(
 def determine_direction(
     actual_return: float,
 ) -> str:
-    """Convert actual return into direction."""
+    """
+    Convert actual return into direction.
+    """
 
     if actual_return > 0:
+
         return "UP"
 
     if actual_return < 0:
+
         return "DOWN"
 
     return "FLAT"
@@ -1012,20 +716,22 @@ def determine_direction(
 def calculate_actual_risk(
     prices: pd.DataFrame,
     entry_price: float,
-    entry_date: datetime,
-    exit_date: datetime,
+    start_date: date,
+    end_date: date,
 ) -> float | None:
     """
-    Calculate realised risk during the evaluation period.
+    Calculate realised risk during the prediction horizon.
 
-    Risk is the maximum absolute percentage movement from
-    entry_price between the entry and exit trading dates.
+    Risk is measured as the maximum absolute percentage move
+    away from the entry price during the evaluation period.
     """
 
     if prices.empty:
+
         return None
 
     if entry_price <= 0:
+
         return None
 
     price_column = get_price_column(
@@ -1033,53 +739,52 @@ def calculate_actual_risk(
     )
 
     if price_column is None:
+
         return None
 
-    start_date = (
-        normalize_datetime_to_date(
-            entry_date
-        ).date()
+    start_timestamp = pd.Timestamp(
+        start_date
     )
 
-    end_date = (
-        normalize_datetime_to_date(
-            exit_date
-        ).date()
+    end_timestamp = pd.Timestamp(
+        end_date
     )
 
     period = prices.loc[
         (
-            prices.index.date >= start_date
+            prices.index >= start_timestamp
         )
         &
         (
-            prices.index.date <= end_date
+            prices.index <= end_timestamp
         )
     ]
 
     if period.empty:
+
         return None
 
     values = pd.to_numeric(
-        period[
-            price_column
-        ],
+        period[price_column],
         errors="coerce",
     ).dropna()
 
     if values.empty:
+
         return None
 
     percentage_moves = (
         (
             values
             - entry_price
-        ).abs()
+        )
+        .abs()
         / entry_price
         * 100.0
     )
 
     if percentage_moves.empty:
+
         return None
 
     return float(
@@ -1098,35 +803,21 @@ def evaluate_single_prediction(
     """
     Evaluate a single prediction.
 
-    Evaluation rules:
-
-    1. Determine symbol.
-    2. Determine prediction market date.
-    3. Calculate evaluation target date.
-    4. Wait until target date is reached.
-    5. Fetch historical prices.
-    6. Find actual entry trading session.
-    7. Find first trading session on or after target date.
-    8. Evaluate only when both prices are available.
+    The prediction is evaluated only after its configured
+    horizon has been reached.
     """
 
-    prediction_id = get_prediction_id(
-        row
-    )
-
     result: dict[str, Any] = {
-        "prediction_id": prediction_id,
         "actual_return": None,
         "actual_direction": None,
         "actual_risk": None,
         "evaluation_status": "WAITING",
         "evaluation_timestamp": None,
-        "evaluation_target_date": None,
-        "entry_price": None,
-        "exit_price": None,
-        "entry_timestamp": None,
-        "exit_timestamp": None,
         "evaluation_error": None,
+        "entry_price": None,
+        "entry_timestamp": None,
+        "exit_price": None,
+        "exit_timestamp": None,
     }
 
     # --------------------------------------------------------
@@ -1150,59 +841,57 @@ def evaluate_single_prediction(
         return result
 
     # --------------------------------------------------------
-    # PREDICTION MARKET DATE
+    # PREDICTION TIME
     # --------------------------------------------------------
 
-    prediction_market_date = (
-        get_prediction_market_date(
+    prediction_time = (
+        get_prediction_timestamp(
             row
         )
     )
 
-    if prediction_market_date is None:
+    if prediction_time is None:
 
         result["evaluation_status"] = (
             "INVALID"
         )
 
         result["evaluation_error"] = (
-            "Missing prediction market date."
+            "Missing prediction timestamp."
         )
 
         return result
 
-    # --------------------------------------------------------
-    # EVALUATION TARGET DATE
-    # --------------------------------------------------------
-
-    target_date = (
-        calculate_evaluation_target_date(
-            prediction_market_date,
-            horizon_days,
+    prediction_date = (
+        datetime_to_date(
+            prediction_time
         )
     )
 
-    result[
-        "evaluation_target_date"
-    ] = target_date.strftime(
-        "%Y-%m-%d"
+    # --------------------------------------------------------
+    # TARGET DATE
+    # --------------------------------------------------------
+
+    target_date = (
+        prediction_date
+        + timedelta(
+            days=max(
+                1,
+                int(horizon_days),
+            )
+        )
     )
 
-    # --------------------------------------------------------
-    # WAIT FOR HORIZON
-    # --------------------------------------------------------
+    current_date = utc_now().date()
 
-    if not target_horizon_reached(
-        target_date
-    ):
+    if current_date < target_date:
 
         result["evaluation_status"] = (
             "WAITING"
         )
 
         result["evaluation_error"] = (
-            "Evaluation target date has not "
-            "been reached."
+            "Evaluation horizon not reached."
         )
 
         return result
@@ -1216,8 +905,8 @@ def evaluate_single_prediction(
         prices = (
             fetch_historical_prices(
                 symbol=symbol,
-                start=prediction_market_date,
-                end=target_date,
+                start_date=prediction_date,
+                end_date=target_date,
             )
         )
 
@@ -1253,42 +942,16 @@ def evaluate_single_prediction(
         row
     )
 
-    entry_timestamp: datetime | None = None
-
-    entry_trading_date = (
-        select_first_trading_date_on_or_after(
-            prices,
-            prediction_market_date,
-        )
-    )
-
-    if entry_trading_date is None:
-
-        result["evaluation_status"] = (
-            "WAITING"
-        )
-
-        result["evaluation_error"] = (
-            "Prediction trading session is "
-            "not available."
-        )
-
-        return result
+    entry_timestamp = None
 
     if entry_price is None:
 
         (
             entry_price,
             entry_timestamp,
-        ) = select_price_for_trading_date(
+        ) = select_price_on_or_after_date(
             prices,
-            entry_trading_date,
-        )
-
-    else:
-
-        entry_timestamp = (
-            entry_trading_date
+            prediction_date,
         )
 
     if entry_price is None:
@@ -1304,35 +967,15 @@ def evaluate_single_prediction(
         return result
 
     # --------------------------------------------------------
-    # EXIT TRADING SESSION
+    # EXIT PRICE
     # --------------------------------------------------------
-
-    exit_trading_date = (
-        select_first_trading_date_on_or_after(
-            prices,
-            target_date,
-        )
-    )
-
-    if exit_trading_date is None:
-
-        result["evaluation_status"] = (
-            "WAITING"
-        )
-
-        result["evaluation_error"] = (
-            "Evaluation trading session close "
-            "is not available yet."
-        )
-
-        return result
 
     (
         exit_price,
         exit_timestamp,
-    ) = select_price_for_trading_date(
+    ) = select_price_on_or_after_date(
         prices,
-        exit_trading_date,
+        target_date,
     )
 
     if exit_price is None:
@@ -1342,14 +985,13 @@ def evaluate_single_prediction(
         )
 
         result["evaluation_error"] = (
-            "Could not determine evaluation "
-            "exit price."
+            "Evaluation market close not available."
         )
 
         return result
 
     # --------------------------------------------------------
-    # ACTUAL RETURN
+    # RETURN
     # --------------------------------------------------------
 
     try:
@@ -1374,20 +1016,20 @@ def evaluate_single_prediction(
         return result
 
     # --------------------------------------------------------
-    # ACTUAL RISK
+    # RISK
     # --------------------------------------------------------
 
     actual_risk = (
         calculate_actual_risk(
             prices=prices,
             entry_price=entry_price,
-            entry_date=entry_trading_date,
-            exit_date=exit_trading_date,
+            start_date=prediction_date,
+            end_date=target_date,
         )
     )
 
     # --------------------------------------------------------
-    # SUCCESS
+    # RESULT
     # --------------------------------------------------------
 
     result.update(
@@ -1399,25 +1041,23 @@ def evaluate_single_prediction(
                 )
             ),
             "actual_risk": actual_risk,
-            "evaluation_status": (
-                "EVALUATED"
-            ),
+            "evaluation_status": "EVALUATED",
             "evaluation_timestamp": (
-                utc_now_iso()
+                utc_now().isoformat()
             ),
+            "evaluation_error": None,
             "entry_price": entry_price,
-            "exit_price": exit_price,
             "entry_timestamp": (
                 entry_timestamp.isoformat()
                 if entry_timestamp
                 else None
             ),
+            "exit_price": exit_price,
             "exit_timestamp": (
                 exit_timestamp.isoformat()
                 if exit_timestamp
                 else None
             ),
-            "evaluation_error": None,
         }
     )
 
@@ -1432,12 +1072,9 @@ def resolve_actual_outcomes(
     predictions: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Resolve actual outcomes for pending predictions.
+    Resolve actual outcomes for all supplied predictions.
 
-    This function preserves the existing prediction rows and
-    adds or updates evaluation fields.
-
-    It is compatible with:
+    This is the main function called by:
 
         scripts/evaluation_job.py
     """
@@ -1452,16 +1089,25 @@ def resolve_actual_outcomes(
 
     config = get_evaluation_config()
 
-    horizon_days = int(
-        config.get(
-            "horizon_days",
-            1,
-        )
+    horizon_days = config.get(
+        "horizon_days",
+        1,
     )
 
+    try:
+
+        horizon_days = max(
+            1,
+            int(horizon_days),
+        )
+
+    except Exception:
+
+        horizon_days = 1
+
     logger.info(
-        "Evaluating %s prediction(s) | "
-        "horizon=%s day(s)",
+        "Evaluating %s prediction(s) "
+        "with horizon=%s day(s).",
         len(predictions),
         horizon_days,
     )
@@ -1474,7 +1120,6 @@ def resolve_actual_outcomes(
         "actual_risk",
         "evaluation_status",
         "evaluation_timestamp",
-        "evaluation_target_date",
         "evaluation_error",
         "entry_price",
         "entry_timestamp",
@@ -1494,15 +1139,9 @@ def resolve_actual_outcomes(
 
     for index, row in predictions.iterrows():
 
-        prediction_id = get_prediction_id(
-            row
-        )
-
         logger.info(
-            "Evaluating prediction | "
-            "index=%s | prediction_id=%s",
+            "Evaluating prediction index=%s",
             index,
-            prediction_id,
         )
 
         outcome = (
@@ -1554,7 +1193,7 @@ def resolve_actual_outcomes(
 
 
 # ============================================================
-# ALIAS
+# COMPATIBILITY ALIAS
 # ============================================================
 
 def fetch_actuals(
@@ -1581,22 +1220,18 @@ def main() -> int:
     sample = pd.DataFrame(
         [
             {
-                "prediction_id": (
-                    "test_prediction_001"
-                ),
                 "symbol": "RELIANCE",
-                "market_date": (
-                    utc_now()
-                    - timedelta(days=3)
-                ).strftime(
-                    "%Y-%m-%d"
-                ),
                 "prediction_date": (
-                    utc_now()
-                    - timedelta(days=3)
-                ).isoformat(),
+                    (
+                        utc_now()
+                        - timedelta(
+                            days=5
+                        )
+                    ).isoformat()
+                ),
                 "predicted_return": 1.5,
                 "predicted_direction": "UP",
+                "evaluation_status": "PENDING",
             }
         ]
     )
