@@ -1,4 +1,157 @@
 # ============================================================
+# PROJECT CONFIGURATION
+# ============================================================
+
+project:
+
+  name: ai-stock-prediction-system
+
+  environment: production
+
+  timezone: Asia/Kolkata
+
+
+# ============================================================
+# DATA
+# ============================================================
+
+data:
+
+  prediction_ledger: data/ledger/predictions.csv
+
+  predictions_path: data/predictions
+
+  reports_path: data/reports
+
+  models_path: data/models
+
+
+# ============================================================
+# PATHS
+# ============================================================
+
+paths:
+
+  prediction_ledger: data/ledger/predictions.csv
+
+  predictions: data/predictions
+
+  reports: data/reports
+
+  models: data/models
+
+
+# ============================================================
+# MARKET
+# ============================================================
+
+market:
+
+  exchange: NSE
+
+  suffix: ".NS"
+
+  timezone: Asia/Kolkata
+
+
+# ============================================================
+# PREDICTION
+# ============================================================
+
+prediction:
+
+  enabled: true
+
+  top_n: 5
+
+  minimum_confidence: 0.0
+
+
+# ============================================================
+# TELEGRAM
+# ============================================================
+
+telegram:
+
+  enabled: true
+
+  # Secrets should normally be supplied through environment
+  # variables in GitHub Actions:
+  #
+  # TELEGRAM_BOT_TOKEN
+  # TELEGRAM_CHAT_ID
+
+  bot_token: null
+
+  chat_id: null
+
+
+# ============================================================
+# EVALUATION
+# ============================================================
+
+evaluation:
+
+  enabled: true
+
+  horizon_days: 1
+
+  price_source: yahoo
+
+
+# ============================================================
+# MONITORING
+# ============================================================
+
+monitoring:
+
+  enabled: true
+
+  minimum_health_score: 50
+
+
+# ============================================================
+# CIRCUIT BREAKER
+# ============================================================
+
+circuit_breaker:
+
+  enabled: true
+
+  fail_closed: true
+
+  minimum_health_score: 50
+
+
+# ============================================================
+# DRIFT MONITORING
+# ============================================================
+
+drift:
+
+  enabled: true
+
+  lookback_days: 30
+
+  minimum_samples: 30
+
+  feature_drift_threshold: 0.20
+
+  performance_drift_threshold: 0.10
+
+
+# ============================================================
+# MODEL STORAGE
+# ============================================================
+
+model_store:
+
+  enabled: true
+
+  path: data/models
+
+
+# ============================================================
 # PRODUCTION MODEL REGISTRY
 # ============================================================
 
@@ -6,10 +159,10 @@ model_registry:
 
   enabled: true
 
-  # Persistent registry containing the active production Champion.
+  # Registry containing the current production Champion.
   path: data/models/model_registry.json
 
-  # Keep a history of model promotion and rollback events.
+  # Keep promotion / rollback history.
   keep_history: true
 
 
@@ -19,17 +172,17 @@ model_registry:
 
 models:
 
-  # Dynamic production model registry.
+  # Central production model registry.
   registry_path: data/models/model_registry.json
 
-  # During initial deployment, allow the existing per-symbol
-  # ModelStore models when no production Champion is registered.
+  # During deployment, allow the existing model loading
+  # mechanism when a Champion has not yet been registered.
   require_champion: false
 
-  # Existing model loading remains available as a fallback.
+  # Existing per-symbol models remain available as fallback.
   allow_fallback_model: true
 
-  # Cache loaded production models within a running process.
+  # Cache loaded models during the running process.
   cache_enabled: true
 
 
@@ -41,25 +194,67 @@ champion_challenger:
 
   enabled: true
 
-  # Legacy/current logical model names.
   champion: current
+
   challenger: challenger_v1
 
   minimum_evaluations: 30
+
   comparison_window: 50
 
-  # Challenger must outperform the Champion by at least 2%.
+  # Challenger must improve by at least 2%.
   minimum_improvement: 0.02
 
   evaluate_return_mae: true
+
   evaluate_direction_accuracy: true
+
   evaluate_brier_score: true
+
   evaluate_risk_mae: true
 
-  # Promotion remains controlled until the production loader
-  # has been fully validated.
+  # Promotion is intentionally controlled.
   auto_promote: false
+
   require_manual_approval: true
 
-  # After promotion, the registry becomes the source of truth.
+  # Use the production registry as the source of truth.
   use_model_registry: true
+
+
+# ============================================================
+# TRAINING
+# ============================================================
+
+training:
+
+  enabled: true
+
+  minimum_samples: 100
+
+  retrain_on_drift: true
+
+  save_models: true
+
+
+# ============================================================
+# SCHEDULING
+# ============================================================
+
+schedule:
+
+  morning_prediction:
+
+    enabled: true
+
+  evaluation:
+
+    enabled: true
+
+  drift_monitoring:
+
+    enabled: true
+
+  training:
+
+    enabled: true
