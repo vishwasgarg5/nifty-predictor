@@ -1,36 +1,47 @@
-name: Auto Meta Refresh (Holidays + IPO GMP)
+name: Auto Meta Refresh
 
 on:
   schedule:
-    # ~08:00 IST daily
-    - cron: '30 2 * * *'
+    - cron: "0 3 * * 1-5"   # 08:30 IST approx
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   meta:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    permissions:
-      contents: write
-
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          python-version: "3.11"
+          cache: pip
 
       - name: Install deps
         run: |
-          pip install --upgrade pip
-          pip install pandas requests lxml html5lib pyyaml python-dotenv
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Refresh holidays + IPO GMP
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python scripts/refresh_meta.py
+          IPOGURU_API_KEY: ${{ secrets.IPOGURU_API_KEY }}
+        run: |
+          mkdir -p data
+          python scripts/refresh_meta.py
+          ls -la data/ || true
+
+      - name: Sync main before commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git pull --rebase origin main || true
 
       - name: Commit refreshed data
         uses: stefanzweifel/git-auto-commit-action@v5
