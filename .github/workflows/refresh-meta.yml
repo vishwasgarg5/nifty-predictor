@@ -1,0 +1,26 @@
+name: Auto Meta Refresh (Holidays + IPO GMP)
+
+on:
+  schedule:
+    - cron: '30 2 * * *'   # ~08:00 IST
+  workflow_dispatch:
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: |
+          pip install pandas requests lxml html5lib pyyaml python-dotenv
+      - name: Refresh holidays + IPO GMP
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/refresh_meta.py
+      - uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "data: auto refresh holidays + IPO GMP"
+          file_pattern: "data/holidays.json data/ipo_pipeline.csv"
