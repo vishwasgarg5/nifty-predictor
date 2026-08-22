@@ -1,20 +1,20 @@
-name: Weekly - Model Precision Report
+name: Weekly - Report + Retrain
 
 on:
   schedule:
-    # 10:00 IST Saturday = 04:30 UTC Saturday
+    # Saturday 10:00 IST = 04:30 UTC
     - cron: '30 4 * * 6'
   workflow_dispatch:
 
 jobs:
-  weekly-report:
+  weekly:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 60
     permissions:
       contents: write
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Python 3.11
@@ -29,18 +29,33 @@ jobs:
           pip install -r requirements.txt
 
       - name: Create directories
-        run: mkdir -p data/history
+        run: mkdir -p data/history models
 
-      - name: Run Weekly Report
+      - name: Download models
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: models
+          path: models
+
+      - name: Run Weekly Job
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: python scripts/weekly_job.py
+
+      - name: Upload models
+        uses: actions/upload-artifact@v4
+        with:
+          name: models
+          path: models/
+          retention-days: 21
 
       - name: Commit weekly summary
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "data: weekly precision report ${{ github.run_id }}"
-          file_pattern: "data/history/weekly_reports.csv"
+          commit_message: "data: weekly report ${{ github.run_id }}"
+          file_pattern: "data/history/*.csv"
           commit_user_name: github-actions[bot]
           commit_user_email: github-actions[bot]@users.noreply.github.com
