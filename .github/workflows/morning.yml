@@ -1,75 +1,64 @@
-name: Morning - Stocks + Indexes + IPO Desk
+name: Morning - Stocks Indexes IPO
 
 on:
   schedule:
-    # 08:45 IST = 03:15 UTC (Mon–Fri)
-    - cron: '15 3 * * 1-5'
+    - cron: "15 3 * * 1-5"   # ~08:45 IST
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   morning:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
-    permissions:
-      contents: write
-
+    timeout-minutes: 45
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          fetch-depth: 0
 
-      - name: Install dependencies
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install deps
         run: |
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install lxml html5lib
 
-      - name: Create directories
-        run: |
-          mkdir -p data/predictions data/history data/universes models
-
-      - name: Download model artifacts
-        uses: actions/download-artifact@v4
-        continue-on-error: true
-        with:
-          name: models
-          path: models
-
-      - name: Light meta refresh (holidays + IPO GMP)
-        continue-on-error: true
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python scripts/refresh_meta.py
-
-      - name: Run Morning Job
+      - name: Run morning job
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: python scripts/morning_job.py
+          FORCE_MORNING: ${{ github.event_name == 'workflow_dispatch' && 'true' || 'false' }}
+        run: |
+          mkdir -p data/predictions models
+          python scripts/morning_job.py
 
-      - name: Upload models + predictions
+      - name: Upload predictions artifact
         uses: actions/upload-artifact@v4
         with:
-          name: models
+          name: predictions-${{ github.run_id }}
           path: |
-            models/
             data/predictions/
+            models/
+          if-no-files-found: ignore
           retention-days: 14
 
-      - name: Commit data files
+      - name: Sync main before commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git pull --rebase origin main || true
+
+      - name: Commit predictions
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "data: morning run ${{ github.run_id }}"
+          commit_message: "data: morning predictions ${{ github.run_id }}"
           file_pattern: |
             data/predictions/*.csv
-            data/holidays.json
-            data/ipo_pipeline.csv
           commit_user_name: github-actions[bot]
           commit_user_email: github-actions[bot]@users.noreply.github.com
