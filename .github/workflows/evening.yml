@@ -2,59 +2,52 @@ name: Evening - Actual vs Predicted
 
 on:
   schedule:
-    # 16:15 IST = 10:45 UTC (Mon–Fri)
-    - cron: '45 10 * * 1-5'
+    - cron: "45 10 * * 1-5"  # ~16:15 IST
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   evening:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-    permissions:
-      contents: write
-
+    timeout-minutes: 30
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          fetch-depth: 0
 
-      - name: Install dependencies
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install deps
         run: |
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Create directories
-        run: mkdir -p data/predictions data/history models
-
-      - name: Download models + predictions
-        uses: actions/download-artifact@v4
-        continue-on-error: true
-        with:
-          name: models
-          path: .
-
-      - name: Run Evening Job
+      - name: Run evening job
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python scripts/evening_job.py
+        run: |
+          mkdir -p data/history data/predictions
+          python scripts/evening_job.py
 
-      - name: Upload updated models
-        uses: actions/upload-artifact@v4
-        with:
-          name: models
-          path: models/
-          retention-days: 14
+      - name: Sync main before commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git pull --rebase origin main || true
 
       - name: Commit error history
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "data: evening errors ${{ github.run_id }}"
-          file_pattern: "data/history/*.csv"
+          file_pattern: |
+            data/history/daily_errors.csv
+            data/history/*.csv
           commit_user_name: github-actions[bot]
           commit_user_email: github-actions[bot]@users.noreply.github.com
