@@ -1,14 +1,68 @@
 # ============================================================
-# PROJECT CONFIGURATION
+# MARKET PREDICTION SYSTEM CONFIGURATION
 # ============================================================
 
-project:
 
-  name: ai-stock-prediction-system
+# ============================================================
+# PATHS
+# ============================================================
 
-  environment: production
+paths:
 
-  timezone: Asia/Kolkata
+  data_dir: data
+
+  universes_dir: data/universes
+
+  models_dir: data/models
+
+  artifacts_dir: data/artifacts
+
+  logs_dir: data/logs
+
+  reports_dir: data/reports
+
+  prediction_ledger: data/ledger/predictions.csv
+
+  ledger: data/ledger/predictions.csv
+
+
+# ============================================================
+# MARKET UNIVERSE
+# ============================================================
+
+universes:
+
+  primary:
+
+    - nifty100
+
+  secondary: []
+
+  include_ipo: false
+
+
+# ============================================================
+# PREDICTION
+# ============================================================
+
+prediction:
+
+  top_n: 5
+
+  minimum_confidence: 0.0
+
+  minimum_opportunity_score: 0.0
+
+
+# ============================================================
+# EVALUATION
+# ============================================================
+
+evaluation:
+
+  horizon_days: 1
+
+  price_source: yahoo
 
 
 # ============================================================
@@ -19,52 +73,7 @@ data:
 
   prediction_ledger: data/ledger/predictions.csv
 
-  predictions_path: data/predictions
-
-  reports_path: data/reports
-
-  models_path: data/models
-
-
-# ============================================================
-# PATHS
-# ============================================================
-
-paths:
-
-  prediction_ledger: data/ledger/predictions.csv
-
-  predictions: data/predictions
-
-  reports: data/reports
-
-  models: data/models
-
-
-# ============================================================
-# MARKET
-# ============================================================
-
-market:
-
-  exchange: NSE
-
-  suffix: ".NS"
-
-  timezone: Asia/Kolkata
-
-
-# ============================================================
-# PREDICTION
-# ============================================================
-
-prediction:
-
-  enabled: true
-
-  top_n: 5
-
-  minimum_confidence: 0.0
+  ledger: data/ledger/predictions.csv
 
 
 # ============================================================
@@ -75,28 +84,9 @@ telegram:
 
   enabled: true
 
-  # Secrets should normally be supplied through environment
-  # variables in GitHub Actions:
-  #
-  # TELEGRAM_BOT_TOKEN
-  # TELEGRAM_CHAT_ID
-
   bot_token: null
 
   chat_id: null
-
-
-# ============================================================
-# EVALUATION
-# ============================================================
-
-evaluation:
-
-  enabled: true
-
-  horizon_days: 1
-
-  price_source: yahoo
 
 
 # ============================================================
@@ -109,6 +99,8 @@ monitoring:
 
   minimum_health_score: 50
 
+  warning_health_score: 70
+
 
 # ============================================================
 # CIRCUIT BREAKER
@@ -118,143 +110,28 @@ circuit_breaker:
 
   enabled: true
 
-  fail_closed: true
+  failure_threshold: 3
+
+  cooldown_minutes: 60
 
   minimum_health_score: 50
 
 
 # ============================================================
-# DRIFT MONITORING
+# MODEL
 # ============================================================
 
-drift:
+model:
 
-  enabled: true
+  name: default
 
-  lookback_days: 30
-
-  minimum_samples: 30
-
-  feature_drift_threshold: 0.20
-
-  performance_drift_threshold: 0.10
+  version: production
 
 
 # ============================================================
-# MODEL STORAGE
+# LOGGING
 # ============================================================
 
-model_store:
+logging:
 
-  enabled: true
-
-  path: data/models
-
-
-# ============================================================
-# PRODUCTION MODEL REGISTRY
-# ============================================================
-
-model_registry:
-
-  enabled: true
-
-  # Registry containing the current production Champion.
-  path: data/models/model_registry.json
-
-  # Keep promotion / rollback history.
-  keep_history: true
-
-
-# ============================================================
-# PRODUCTION MODEL LOADING
-# ============================================================
-
-models:
-
-  # Central production model registry.
-  registry_path: data/models/model_registry.json
-
-  # During deployment, allow the existing model loading
-  # mechanism when a Champion has not yet been registered.
-  require_champion: false
-
-  # Existing per-symbol models remain available as fallback.
-  allow_fallback_model: true
-
-  # Cache loaded models during the running process.
-  cache_enabled: true
-
-
-# ============================================================
-# CHAMPION / CHALLENGER
-# ============================================================
-
-champion_challenger:
-
-  enabled: true
-
-  champion: current
-
-  challenger: challenger_v1
-
-  minimum_evaluations: 30
-
-  comparison_window: 50
-
-  # Challenger must improve by at least 2%.
-  minimum_improvement: 0.02
-
-  evaluate_return_mae: true
-
-  evaluate_direction_accuracy: true
-
-  evaluate_brier_score: true
-
-  evaluate_risk_mae: true
-
-  # Promotion is intentionally controlled.
-  auto_promote: false
-
-  require_manual_approval: true
-
-  # Use the production registry as the source of truth.
-  use_model_registry: true
-
-
-# ============================================================
-# TRAINING
-# ============================================================
-
-training:
-
-  enabled: true
-
-  minimum_samples: 100
-
-  retrain_on_drift: true
-
-  save_models: true
-
-
-# ============================================================
-# SCHEDULING
-# ============================================================
-
-schedule:
-
-  morning_prediction:
-
-    enabled: true
-
-  evaluation:
-
-    enabled: true
-
-  drift_monitoring:
-
-    enabled: true
-
-  training:
-
-    enabled: true
+  level: INFO
