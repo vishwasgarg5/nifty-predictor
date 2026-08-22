@@ -1,44 +1,65 @@
 import pandas as pd
-import pandas_ta_classic as ta
-import logging
+from ta.trend import SMAIndicator, EMAIndicator, MACD
+from ta.momentum import RSIIndicator
+from ta.volatility import BollingerBands, AverageTrueRange
+from ta.volume import OnBalanceVolumeIndicator
 
-logger = logging.getLogger(__name__)
 
-def create_features(df: pd.DataFrame) -> pd.DataFrame:
+FEATURE_COLS = [
+    "Open", "High", "Low", "Close", "Volume",
+    "SMA20", "EMA20", "RSI", "MACD",
+    "BB_H", "BB_L", "ATR", "OBV",
+    "Close_Lag1", "Close_Lag2", "Close_Lag3",
+    "Daily_Return", "Volatility",
+]
+
+
+def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
 
-    need = ["Open", "High", "Low", "Close", "Volume"]
-    if any(c not in df.columns for c in need):
-        return pd.DataFrame()
+    df["SMA20"] = SMAIndicator(df["Close"], window=20).sma_indicator()
+    df["EMA20"] = EMAIndicator(df["Close"], window=20).ema_indicator()
+    df["RSI"] = RSIIndicator(df["Close"], window=14).rsi()
+    df["MACD"] = MACD(df["Close"]).macd()
 
-    df = df[need].dropna()
-    if len(df) < 50:
-        return pd.DataFrame()
+    bb = BollingerBands(df["Close"], window=20)
+    df["BB_H"] = bb.bollinger_hband()
+    df["BB_L"] = bb.bollinger_lband()
 
-    try:
-        df["ret_1"] = df["Close"].pct_change()
-        df["ret_5"] = df["Close"].pct_change(5)
-        df["sma_10"] = ta.sma(df["Close"], length=10)
-        df["sma_20"] = ta.sma(df["Close"], length=20)
-        df["sma_50"] = ta.sma(df["Close"], length=50)
-        df["rsi_14"] = ta.rsi(df["Close"], length=14)
-        macd = ta.macd(df["Close"])
-        if macd is not None and not macd.empty:
-            df = pd.concat([df, macd], axis=1)
-        df["atr_14"] = ta.atr(df["High"], df["Low"], df["Close"], length=14)
-        df["atr_pct"] = df["atr_14"] / df["Close"] * 100
-        df["vol_sma_20"] = df["Volume"].rolling(20).mean()
-        df["vol_ratio"] = df["Volume"] / df["vol_sma_20"]
-        df["close_sma20_ratio"] = df["Close"] / df["sma_20"]
+    df["ATR"] = AverageTrueRange(
+        df["High"], df["Low"], df["Close"]
+    ).average_true_range()
 
-        df["target_o"] = df["Open"].shift(-1)
-        df["target_h"] = df["High"].shift(-1)
-        df["target_l"] = df["Low"].shift(-1)
-        df["target_c"] = df["Close"].shift(-1)
+    df["OBV"] = OnBalanceVolumeIndicator(
+        close=df["Close"],
+        volume=df["Volume"],
+    ).on_balance_volume()
 
-        return df.dropna()
-    except Exception as e:
-        logger.error(f"features error: {e}")
-        return pd.DataFrame()
+    df["Close_Lag1"] = df["Close"].shift(1)
+    df["Close_Lag2"] = df["Close"].shift(2)
+    df["Close_Lag3"] = df["Close"].shift(3)
+
+    df["Daily_Return"] = df["Close"].pct_change()
+    df["Volatility"] = df["Daily_Return"].rolling(10).std()
+
+    return df
+
+
+def create_training_data(df: pd.DataFrame) -> pd.DataFrame:
+    """Features + next-day targets for model training."""
+    df = _add_indicators(df)
+
+    df["target_o"] = df["Open"].shift(-1)
+    df["target_h"] = df["High"].shift(-1)
+    df["target_l"] = df["Low"].shift(-1)
+    df["target_c"] = df["Close"].shift(-1)
+
+    return df.dropna().reset_index(drop=True)
+
+
+def create_inference_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Latest feature row without dropping the final market day."""
+    df = _add_indicators(df)
+
+    latest = df[FEATURE_COLS].iloc[[-1]]
+    return latest.dropna()
