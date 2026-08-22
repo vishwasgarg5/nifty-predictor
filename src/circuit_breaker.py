@@ -3,34 +3,53 @@
 """
 Production Circuit Breaker.
 
-Controls whether stock predictions are allowed to be sent
+Controls whether market predictions are allowed to be delivered
 to Telegram.
 
-States
-------
-CLOSED
-    System is healthy.
-    Predictions are allowed.
+State Machine
+-------------
 
-OPEN
-    System is unhealthy or a critical failure occurred.
-    Predictions are blocked.
+                    critical failure
+        ┌─────────────────────────────────────┐
+        │                                     ▼
+     CLOSED ──────────────────────────────── OPEN
+        ▲                                     │
+        │                                     │ cooldown
+        │                                     ▼
+        │                                HALF_OPEN
+        │                                     │
+        │                    ┌────────────────┴───────────────┐
+        │                    │                                │
+        │                    ▼                                ▼
+        └──────────── recovery success                     failure
+                         CLOSED                            OPEN
 
-HALF_OPEN
-    Cooldown period has passed.
-    The system may perform a limited recovery check.
 
-The breaker state is persisted to:
+The circuit breaker does NOT stop:
 
-    data/monitoring/circuit_breaker.json
+    - prediction generation
+    - prediction ledger updates
+    - actual outcome evaluation
+    - model evaluation
+    - drift detection
+
+It only controls whether predictions may be delivered to Telegram.
+
+Public API
+----------
+
+    can_send_predictions()
+    get_status()
+    register_failure()
+    register_success()
+    reset_circuit_breaker()
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import os
-import tempfile
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -42,158 +61,33 @@ from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 
 # ============================================================
 # LOGGING
 # ============================================================
 
+logging.basicConfig(
+    level=logging.INFO,
+    format=(
+        "%(asctime)s | "
+        "%(levelname)s | "
+        "%(name)s | "
+        "%(message)s"
+    ),
+)
+
 logger = logging.getLogger("circuit_breaker")
 
 
 # ============================================================
-# STATES
-# ============================================================
-
-CLOSED = "CLOSED"
-OPEN = "OPEN"
-HALF_OPEN = "HALF_OPEN"
-
-VALID_STATES = {
-    CLOSED,
-    OPEN,
-    HALF_OPEN,
-}
-
-
-# ============================================================
-# DEFAULT CONFIGURATION
-# ============================================================
-
-DEFAULT_CONFIG = {
-    "enabled": True,
-    "failure_threshold": 1,
-    "cooldown_minutes": 60,
-    "health_open_threshold": 50,
-    "health_close_threshold": 80,
-    "state_file": "data/monitoring/circuit_breaker.json",
-}
-
-
-# ============================================================
-# CONFIG HELPERS
-# ============================================================
-
-def _object_to_dict(value: Any) -> dict[str, Any]:
-    """
-    Convert a config object or mapping into a dictionary.
-    """
-
-    if value is None:
-        return {}
-
-    if isinstance(value, dict):
-        return dict(value)
-
-    if hasattr(value, "items"):
-        try:
-            return dict(value.items())
-        except Exception:
-            pass
-
-    if hasattr(value, "__dict__"):
-        return {
-            key: item
-            for key, item in vars(value).items()
-            if not key.startswith("_")
-        }
-
-    return {}
-
-
-def load_circuit_breaker_config() -> dict[str, Any]:
-    """
-    Load circuit breaker configuration.
-
-    Reads:
-
-        circuit_breaker:
-          ...
-
-    from src.config.cfg.
-
-    Falls back to safe defaults if the project config
-    cannot be imported.
-    """
-
-    config = dict(DEFAULT_CONFIG)
-
-    try:
-        from src.config import cfg
-
-        section = getattr(
-            cfg,
-            "circuit_breaker",
-            None,
-        )
-
-        values = _object_to_dict(section)
-
-        if values:
-            config.update(values)
-
-    except Exception as error:
-
-        logger.warning(
-            "Could not load circuit breaker config. "
-            "Using defaults: %s",
-            error,
-        )
-
-    return config
-
-
-# ============================================================
-# PATH HELPERS
-# ============================================================
-
-def resolve_project_path(
-    value: str | Path,
-) -> Path:
-    """
-    Resolve a path relative to the project root.
-    """
-
-    path = Path(value)
-
-    if path.is_absolute():
-        return path
-
-    return PROJECT_ROOT / path
-
-
-def get_state_file_path() -> Path:
-    """
-    Return the circuit breaker state file path.
-    """
-
-    config = load_circuit_breaker_config()
-
-    return resolve_project_path(
-        config.get(
-            "state_file",
-            DEFAULT_CONFIG["state_file"],
-        )
-    )
-
-
-# ============================================================
-# TIME HELPERS
+# TIME
 # ============================================================
 
 def utc_now() -> datetime:
-    """
-    Return the current UTC time.
-    """
+    """Return current UTC datetime."""
 
     return datetime.now(
         timezone.utc
@@ -201,9 +95,7 @@ def utc_now() -> datetime:
 
 
 def utc_now_iso() -> str:
-    """
-    Return the current UTC time in ISO format.
-    """
+    """Return current UTC timestamp."""
 
     return utc_now().isoformat()
 
@@ -211,22 +103,14 @@ def utc_now_iso() -> str:
 def parse_datetime(
     value: Any,
 ) -> datetime | None:
-    """
-    Safely parse an ISO datetime.
-    """
+    """Safely parse an ISO datetime."""
 
     if value is None:
         return None
 
-    if not isinstance(value, str):
-        value = str(value)
-
-    value = value.strip()
-
-    if not value:
-        return None
-
     try:
+
+        value = str(value)
 
         parsed = datetime.fromisoformat(
             value.replace(
@@ -251,101 +135,206 @@ def parse_datetime(
 
 
 # ============================================================
-# DEFAULT STATE
+# CONFIG
 # ============================================================
 
-def default_state() -> dict[str, Any]:
-    """
-    Return a new healthy circuit breaker state.
-    """
-
-    now = utc_now_iso()
-
-    return {
-        "state": CLOSED,
-        "failure_count": 0,
-        "opened_at": None,
-        "last_failure_at": None,
-        "last_success_at": now,
-        "last_health_score": None,
-        "last_health_status": "UNKNOWN",
-        "reason": None,
-        "updated_at": now,
-    }
-
-
-# ============================================================
-# STATE VALIDATION
-# ============================================================
-
-def normalize_state(
-    state: dict[str, Any] | None,
+def object_to_dict(
+    value: Any,
 ) -> dict[str, Any]:
-    """
-    Validate and normalize circuit breaker state.
-    """
+    """Convert configuration object into dict."""
 
-    defaults = default_state()
+    if value is None:
+        return {}
 
-    if not isinstance(state, dict):
-        return defaults
+    if isinstance(value, dict):
+        return dict(value)
 
-    result = dict(defaults)
+    if hasattr(value, "items"):
 
-    result.update(state)
+        try:
+            return dict(value.items())
 
-    current_state = str(
-        result.get(
-            "state",
-            CLOSED,
-        )
-    ).upper()
+        except Exception:
+            pass
 
-    if current_state not in VALID_STATES:
+    if hasattr(value, "__dict__"):
 
-        logger.warning(
-            "Invalid circuit breaker state '%s'. "
-            "Resetting to CLOSED.",
-            current_state,
-        )
+        return {
+            key: item
+            for key, item in vars(value).items()
+            if not key.startswith("_")
+        }
 
-        current_state = CLOSED
+    return {}
 
-    result["state"] = current_state
+
+def load_config() -> Any:
+    """Load project config."""
 
     try:
 
-        result["failure_count"] = max(
-            0,
-            int(
-                result.get(
-                    "failure_count",
-                    0,
-                )
-            ),
+        from src.config import cfg
+
+        return cfg
+
+    except Exception as error:
+
+        logger.warning(
+            "Could not load config: %s",
+            error,
         )
 
-    except Exception:
+        return None
 
-        result["failure_count"] = 0
 
-    result["updated_at"] = utc_now_iso()
+def get_circuit_breaker_config() -> dict[str, Any]:
+    """
+    Load circuit breaker configuration.
+
+    Example:
+
+        circuit_breaker:
+            enabled: true
+            failure_threshold: 2
+            recovery_success_threshold: 2
+            cooldown_minutes: 60
+            critical_health_score: 40
+    """
+
+    defaults = {
+        "enabled": True,
+        "failure_threshold": 2,
+        "recovery_success_threshold": 2,
+        "cooldown_minutes": 60,
+        "critical_health_score": 40.0,
+    }
+
+    cfg = load_config()
+
+    if cfg is None:
+        return defaults
+
+    section = getattr(
+        cfg,
+        "circuit_breaker",
+        None,
+    )
+
+    values = object_to_dict(
+        section
+    )
+
+    result = defaults.copy()
+
+    for key in defaults:
+
+        if key not in values:
+            continue
+
+        value = values[key]
+
+        if key == "enabled":
+
+            result[key] = bool(value)
+
+        elif key in {
+            "failure_threshold",
+            "recovery_success_threshold",
+            "cooldown_minutes",
+        }:
+
+            try:
+                result[key] = max(
+                    1,
+                    int(value),
+                )
+            except Exception:
+                pass
+
+        else:
+
+            try:
+                result[key] = float(value)
+            except Exception:
+                pass
 
     return result
 
 
 # ============================================================
-# LOAD / SAVE STATE
+# STATE STORAGE
 # ============================================================
 
+def get_state_path() -> Path:
+    """Return persistent state file path."""
+
+    cfg = load_config()
+
+    if cfg is not None:
+
+        section = getattr(
+            cfg,
+            "circuit_breaker",
+            None,
+        )
+
+        values = object_to_dict(
+            section
+        )
+
+        state_file = values.get(
+            "state_file"
+        )
+
+        if state_file:
+
+            path = Path(
+                str(state_file)
+            )
+
+            if not path.is_absolute():
+
+                path = (
+                    PROJECT_ROOT
+                    / path
+                )
+
+            return path
+
+    return (
+        PROJECT_ROOT
+        / "data"
+        / "state"
+        / "circuit_breaker.json"
+    )
+
+
+def default_state() -> dict[str, Any]:
+    """Create default CLOSED state."""
+
+    return {
+        "state": "CLOSED",
+
+        "failure_count": 0,
+        "success_count": 0,
+
+        "opened_at": None,
+        "last_failure_at": None,
+        "last_success_at": None,
+
+        "last_reason": None,
+
+        "health_score": 100.0,
+        "health_status": "HEALTHY",
+
+        "updated_at": utc_now_iso(),
+    }
+
+
 def load_state() -> dict[str, Any]:
-    """
-    Load persisted circuit breaker state.
+    """Load persistent circuit breaker state."""
 
-    If no state file exists, a healthy CLOSED state is returned.
-    """
-
-    path = get_state_file_path()
+    path = get_state_path()
 
     if not path.exists():
 
@@ -358,14 +347,29 @@ def load_state() -> dict[str, Any]:
             encoding="utf-8",
         ) as file:
 
-            data = json.load(file)
+            state = json.load(
+                file
+            )
 
-        return normalize_state(data)
+        if not isinstance(
+            state,
+            dict,
+        ):
+
+            return default_state()
+
+        result = default_state()
+
+        result.update(
+            state
+        )
+
+        return result
 
     except Exception as error:
 
         logger.error(
-            "Could not read circuit breaker state: %s",
+            "Could not load circuit breaker state: %s",
             error,
         )
 
@@ -374,69 +378,97 @@ def load_state() -> dict[str, Any]:
 
 def save_state(
     state: dict[str, Any],
-) -> Path:
-    """
-    Save circuit breaker state atomically.
-    """
+) -> None:
+    """Persist circuit breaker state."""
 
-    path = get_state_file_path()
+    path = get_state_path()
 
     path.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    normalized = normalize_state(
-        state
-    )
-
-    normalized["updated_at"] = (
+    state["updated_at"] = (
         utc_now_iso()
     )
 
-    temporary_path: Path | None = None
+    with path.open(
+        "w",
+        encoding="utf-8",
+    ) as file:
 
-    try:
-
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=str(path.parent),
-            delete=False,
-            suffix=".tmp",
-        ) as temporary_file:
-
-            json.dump(
-                normalized,
-                temporary_file,
-                indent=2,
-                default=str,
-            )
-
-            temporary_path = Path(
-                temporary_file.name
-            )
-
-        os.replace(
-            temporary_path,
-            path,
+        json.dump(
+            state,
+            file,
+            indent=2,
+            default=str,
         )
 
-        return path
 
-    except Exception:
+# ============================================================
+# STATE TRANSITIONS
+# ============================================================
 
-        if (
-            temporary_path is not None
-            and temporary_path.exists()
-        ):
+def transition_to_open(
+    state: dict[str, Any],
+    reason: str,
+) -> dict[str, Any]:
+    """Move circuit breaker to OPEN."""
 
-            try:
-                temporary_path.unlink()
-            except Exception:
-                pass
+    state["state"] = "OPEN"
 
-        raise
+    state["opened_at"] = (
+        utc_now_iso()
+    )
+
+    state["success_count"] = 0
+
+    state["last_reason"] = reason
+
+    logger.warning(
+        "Circuit breaker OPEN | %s",
+        reason,
+    )
+
+    return state
+
+
+def transition_to_half_open(
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    """Move circuit breaker to HALF_OPEN."""
+
+    state["state"] = "HALF_OPEN"
+
+    state["success_count"] = 0
+
+    logger.warning(
+        "Circuit breaker HALF_OPEN."
+    )
+
+    return state
+
+
+def transition_to_closed(
+    state: dict[str, Any],
+    reason: str = "Recovered.",
+) -> dict[str, Any]:
+    """Move circuit breaker to CLOSED."""
+
+    state["state"] = "CLOSED"
+
+    state["failure_count"] = 0
+    state["success_count"] = 0
+    state["opened_at"] = None
+
+    state["last_reason"] = reason
+
+    logger.info(
+        "Circuit breaker CLOSED | %s",
+        reason,
+    )
+
+    return state
 
 
 # ============================================================
@@ -445,11 +477,9 @@ def save_state(
 
 def cooldown_expired(
     state: dict[str, Any],
-    cooldown_minutes: int,
+    config: dict[str, Any],
 ) -> bool:
-    """
-    Return True if the OPEN state has completed its cooldown.
-    """
+    """Check whether OPEN cooldown has expired."""
 
     opened_at = parse_datetime(
         state.get(
@@ -458,164 +488,152 @@ def cooldown_expired(
     )
 
     if opened_at is None:
-
         return True
 
     cooldown = timedelta(
-        minutes=max(
-            0,
-            int(cooldown_minutes),
-        )
+        minutes=config[
+            "cooldown_minutes"
+        ]
     )
 
     return utc_now() >= (
-        opened_at + cooldown
+        opened_at
+        + cooldown
     )
 
 
 # ============================================================
-# STATE TRANSITIONS
+# STATUS
 # ============================================================
 
-def open_circuit(
-    reason: str,
-    health_score: float | None = None,
-    health_status: str | None = None,
-) -> dict[str, Any]:
+def get_status() -> dict[str, Any]:
     """
-    Open the circuit breaker.
+    Get current circuit breaker status.
 
-    Predictions will be blocked.
+    Automatically moves OPEN → HALF_OPEN when
+    the cooldown period expires.
     """
+
+    config = (
+        get_circuit_breaker_config()
+    )
 
     state = load_state()
 
-    state["state"] = OPEN
+    if not config.get(
+        "enabled",
+        True,
+    ):
 
-    state["failure_count"] = max(
-        1,
-        int(
+        state["state"] = "DISABLED"
+
+        state[
+            "predictions_allowed"
+        ] = True
+
+        state["reason"] = (
+            "Circuit breaker disabled."
+        )
+
+        return state
+
+    current_state = str(
+        state.get(
+            "state",
+            "CLOSED",
+        )
+    ).upper()
+
+    if (
+        current_state == "OPEN"
+        and cooldown_expired(
+            state,
+            config,
+        )
+    ):
+
+        state = transition_to_half_open(
+            state
+        )
+
+        save_state(
+            state
+        )
+
+        current_state = "HALF_OPEN"
+
+    allowed = current_state in {
+        "CLOSED",
+        "HALF_OPEN",
+    }
+
+    state[
+        "predictions_allowed"
+    ] = allowed
+
+    if current_state == "OPEN":
+
+        state["reason"] = (
             state.get(
-                "failure_count",
-                0,
+                "last_reason"
             )
-        ),
-    )
+            or "Circuit breaker is OPEN."
+        )
 
-    state["opened_at"] = utc_now_iso()
+    elif current_state == "HALF_OPEN":
 
-    state["last_failure_at"] = (
-        utc_now_iso()
-    )
+        state["reason"] = (
+            "Recovery test in progress."
+        )
 
-    state["reason"] = str(reason)
+    elif current_state == "CLOSED":
 
-    if health_score is not None:
-
-        try:
-
-            state["last_health_score"] = (
-                float(health_score)
+        state["reason"] = (
+            state.get(
+                "last_reason"
             )
+            or "Circuit breaker is healthy."
+        )
 
-        except Exception:
-
-            pass
-
-    if health_status is not None:
-
-        state["last_health_status"] = str(
-            health_status
-        ).upper()
-
-    save_state(state)
-
-    logger.warning(
-        "Circuit breaker OPENED: %s",
-        reason,
-    )
-
-    return load_state()
-
-
-def half_open_circuit() -> dict[str, Any]:
-    """
-    Move the breaker into HALF_OPEN recovery mode.
-    """
-
-    state = load_state()
-
-    state["state"] = HALF_OPEN
-
-    state["reason"] = (
-        "Cooldown completed. "
-        "Waiting for health recovery confirmation."
-    )
-
-    save_state(state)
-
-    logger.info(
-        "Circuit breaker moved to HALF_OPEN."
-    )
-
-    return load_state()
-
-
-def close_circuit(
-    reason: str = "System health recovered.",
-    health_score: float | None = None,
-    health_status: str | None = "HEALTHY",
-) -> dict[str, Any]:
-    """
-    Close the circuit breaker.
-
-    Predictions are allowed again.
-    """
-
-    state = load_state()
-
-    state["state"] = CLOSED
-
-    state["failure_count"] = 0
-
-    state["opened_at"] = None
-
-    state["reason"] = str(reason)
-
-    state["last_success_at"] = (
-        utc_now_iso()
-    )
-
-    if health_score is not None:
-
-        try:
-
-            state["last_health_score"] = (
-                float(health_score)
-            )
-
-        except Exception:
-
-            pass
-
-    if health_status is not None:
-
-        state["last_health_status"] = str(
-            health_status
-        ).upper()
-
-    save_state(state)
-
-    logger.info(
-        "Circuit breaker CLOSED: %s",
-        reason,
-    )
-
-    return load_state()
+    return state
 
 
 # ============================================================
-# FAILURE / SUCCESS REGISTRATION
+# SEND DECISION
+# ============================================================
+
+def can_send_predictions() -> tuple[
+    bool,
+    str,
+]:
+    """
+    Determine whether Telegram predictions may be sent.
+    """
+
+    status = get_status()
+
+    allowed = bool(
+        status.get(
+            "predictions_allowed",
+            False,
+        )
+    )
+
+    reason = str(
+        status.get(
+            "reason",
+            "Unknown circuit breaker state.",
+        )
+    )
+
+    return (
+        allowed,
+        reason,
+    )
+
+
+# ============================================================
+# FAILURE REGISTRATION
 # ============================================================
 
 def register_failure(
@@ -624,25 +642,103 @@ def register_failure(
     health_status: str | None = None,
 ) -> dict[str, Any]:
     """
-    Register a system failure.
+    Register a production failure.
 
-    Opens the circuit once the configured failure threshold
-    has been reached.
+    Behaviour:
+
+    CLOSED:
+        failure count increases.
+        Opens after failure_threshold.
+
+    HALF_OPEN:
+        any failure immediately returns to OPEN.
+
+    OPEN:
+        remains OPEN.
     """
 
-    config = load_circuit_breaker_config()
-
-    if not bool(
-        config.get(
-            "enabled",
-            True,
-        )
-    ):
-
-        return load_state()
+    config = (
+        get_circuit_breaker_config()
+    )
 
     state = load_state()
 
+    if not config.get(
+        "enabled",
+        True,
+    ):
+
+        return get_status()
+
+    current_state = str(
+        state.get(
+            "state",
+            "CLOSED",
+        )
+    ).upper()
+
+    if health_score is not None:
+
+        try:
+
+            state["health_score"] = float(
+                health_score
+            )
+
+        except Exception:
+            pass
+
+    if health_status is not None:
+
+        state["health_status"] = str(
+            health_status
+        ).upper()
+
+    state[
+        "last_failure_at"
+    ] = utc_now_iso()
+
+    state[
+        "last_reason"
+    ] = str(reason)
+
+    # HALF_OPEN failure immediately reopens.
+    if current_state == "HALF_OPEN":
+
+        state["failure_count"] = (
+            int(
+                state.get(
+                    "failure_count",
+                    0,
+                )
+            )
+            + 1
+        )
+
+        state = transition_to_open(
+            state,
+            reason=(
+                "HALF_OPEN recovery failed: "
+                f"{reason}"
+            ),
+        )
+
+        save_state(
+            state
+        )
+
+        return get_status()
+
+    # OPEN remains OPEN.
+    if current_state == "OPEN":
+
+        save_state(
+            state
+        )
+
+        return get_status()
+
+    # CLOSED failure.
     state["failure_count"] = (
         int(
             state.get(
@@ -653,475 +749,194 @@ def register_failure(
         + 1
     )
 
-    state["last_failure_at"] = (
-        utc_now_iso()
-    )
+    threshold = config[
+        "failure_threshold"
+    ]
 
-    state["reason"] = str(reason)
+    critical_health_score = config[
+        "critical_health_score"
+    ]
+
+    immediate_open = False
 
     if health_score is not None:
 
         try:
 
-            state["last_health_score"] = (
-                float(health_score)
+            immediate_open = (
+                float(
+                    health_score
+                )
+                <= critical_health_score
             )
 
         except Exception:
-
             pass
 
-    if health_status is not None:
+    if (
+        state["failure_count"]
+        >= threshold
+        or immediate_open
+    ):
 
-        state["last_health_status"] = str(
-            health_status
-        ).upper()
+        state = transition_to_open(
+            state,
+            reason=reason,
+        )
 
-    threshold = max(
-        1,
-        int(
-            config.get(
-                "failure_threshold",
-                1,
-            )
-        ),
+    save_state(
+        state
     )
 
-    if state["failure_count"] >= threshold:
+    return get_status()
 
-        state["state"] = OPEN
 
-        state["opened_at"] = (
-            utc_now_iso()
-        )
-
-        logger.warning(
-            "Circuit breaker opening after %s failure(s).",
-            state["failure_count"],
-        )
-
-    save_state(state)
-
-    return load_state()
-
+# ============================================================
+# SUCCESS REGISTRATION
+# ============================================================
 
 def register_success(
     health_score: float | None = None,
-    health_status: str | None = "HEALTHY",
+    health_status: str | None = None,
 ) -> dict[str, Any]:
     """
-    Register a successful health check.
+    Register successful production monitoring.
 
-    The circuit closes only when the health score meets
-    the configured recovery threshold.
+    CLOSED:
+        resets failure count.
+
+    HALF_OPEN:
+        increments recovery success count.
+        Closes after recovery_success_threshold.
     """
 
-    config = load_circuit_breaker_config()
+    config = (
+        get_circuit_breaker_config()
+    )
 
     state = load_state()
 
-    close_threshold = float(
-        config.get(
-            "health_close_threshold",
-            DEFAULT_CONFIG[
-                "health_close_threshold"
-            ],
-        )
-    )
-
-    numeric_score: float | None = None
-
-    if health_score is not None:
-
-        try:
-
-            numeric_score = float(
-                health_score
-            )
-
-            state["last_health_score"] = (
-                numeric_score
-            )
-
-        except Exception:
-
-            numeric_score = None
-
-    if health_status is not None:
-
-        state["last_health_status"] = str(
-            health_status
-        ).upper()
-
-    state["last_success_at"] = (
-        utc_now_iso()
-    )
-
-    if (
-        numeric_score is not None
-        and numeric_score >= close_threshold
+    if not config.get(
+        "enabled",
+        True,
     ):
 
-        return close_circuit(
-            reason=(
-                "Health score recovered to "
-                f"{numeric_score:.2f}."
-            ),
-            health_score=numeric_score,
-            health_status=health_status,
-        )
-
-    save_state(state)
-
-    return load_state()
-
-
-# ============================================================
-# MONITORING INTEGRATION
-# ============================================================
-
-def update_from_health(
-    health_score: Any,
-    health_status: Any,
-    reason: str | None = None,
-) -> dict[str, Any]:
-    """
-    Update the circuit breaker from production monitoring.
-
-    Rules
-    -----
-    * CRITICAL status -> OPEN immediately.
-    * Health score <= health_open_threshold -> OPEN.
-    * Health score >= health_close_threshold -> CLOSED.
-    * OPEN state after cooldown -> HALF_OPEN.
-    """
-
-    config = load_circuit_breaker_config()
-
-    if not bool(
-        config.get(
-            "enabled",
-            True,
-        )
-    ):
-
-        return load_state()
-
-    state = load_state()
-
-    try:
-
-        score = float(
-            health_score
-        )
-
-    except Exception:
-
-        score = None
-
-    status = str(
-        health_status
-        if health_status is not None
-        else "UNKNOWN"
-    ).upper()
-
-    open_threshold = float(
-        config.get(
-            "health_open_threshold",
-            DEFAULT_CONFIG[
-                "health_open_threshold"
-            ],
-        )
-    )
-
-    close_threshold = float(
-        config.get(
-            "health_close_threshold",
-            DEFAULT_CONFIG[
-                "health_close_threshold"
-            ],
-        )
-    )
-
-    failure_reason = reason or (
-        f"System health is {status} "
-        f"with score {score}."
-    )
-
-    # --------------------------------------------------------
-    # CRITICAL STATUS
-    # --------------------------------------------------------
-
-    if status == "CRITICAL":
-
-        return open_circuit(
-            reason=failure_reason,
-            health_score=score,
-            health_status=status,
-        )
-
-    # --------------------------------------------------------
-    # LOW HEALTH SCORE
-    # --------------------------------------------------------
-
-    if (
-        score is not None
-        and score <= open_threshold
-    ):
-
-        return open_circuit(
-            reason=failure_reason,
-            health_score=score,
-            health_status=status,
-        )
-
-    # --------------------------------------------------------
-    # RECOVERY
-    # --------------------------------------------------------
-
-    if (
-        score is not None
-        and score >= close_threshold
-        and status == "HEALTHY"
-    ):
-
-        return close_circuit(
-            reason=(
-                "Monitoring confirmed system recovery."
-            ),
-            health_score=score,
-            health_status=status,
-        )
-
-    # --------------------------------------------------------
-    # OPEN -> HALF_OPEN AFTER COOLDOWN
-    # --------------------------------------------------------
-
-    if state.get("state") == OPEN:
-
-        cooldown_minutes = int(
-            config.get(
-                "cooldown_minutes",
-                DEFAULT_CONFIG[
-                    "cooldown_minutes"
-                ],
-            )
-        )
-
-        if cooldown_expired(
-            state,
-            cooldown_minutes,
-        ):
-
-            return half_open_circuit()
-
-    # --------------------------------------------------------
-    # SAVE CURRENT HEALTH
-    # --------------------------------------------------------
-
-    state["last_health_score"] = score
-
-    state["last_health_status"] = status
-
-    if reason:
-
-        state["reason"] = reason
-
-    save_state(state)
-
-    return load_state()
-
-
-# ============================================================
-# PREDICTION PERMISSION
-# ============================================================
-
-def can_send_predictions() -> tuple[
-    bool,
-    str,
-]:
-    """
-    Determine whether Telegram predictions may be sent.
-
-    Returns
-    -------
-    tuple[bool, str]
-
-        allowed
-            True if predictions are allowed.
-
-        reason
-            Explanation of the current breaker state.
-    """
-
-    config = load_circuit_breaker_config()
-
-    if not bool(
-        config.get(
-            "enabled",
-            True,
-        )
-    ):
-
-        return (
-            True,
-            "Circuit breaker is disabled.",
-        )
-
-    state = load_state()
+        return get_status()
 
     current_state = str(
         state.get(
             "state",
-            CLOSED,
+            "CLOSED",
         )
     ).upper()
 
-    # --------------------------------------------------------
-    # CLOSED
-    # --------------------------------------------------------
+    if health_score is not None:
 
-    if current_state == CLOSED:
+        try:
 
-        return (
-            True,
-            "Circuit breaker is CLOSED. "
-            "Predictions are allowed.",
-        )
-
-    # --------------------------------------------------------
-    # OPEN
-    # --------------------------------------------------------
-
-    if current_state == OPEN:
-
-        cooldown_minutes = int(
-            config.get(
-                "cooldown_minutes",
-                DEFAULT_CONFIG[
-                    "cooldown_minutes"
-                ],
+            state["health_score"] = float(
+                health_score
             )
+
+        except Exception:
+            pass
+
+    if health_status is not None:
+
+        state["health_status"] = str(
+            health_status
+        ).upper()
+
+    state[
+        "last_success_at"
+    ] = utc_now_iso()
+
+    if current_state == "CLOSED":
+
+        state["failure_count"] = 0
+        state["success_count"] = 0
+
+        state["last_reason"] = (
+            "Successful health check."
         )
 
-        if cooldown_expired(
-            state,
-            cooldown_minutes,
+        save_state(
+            state
+        )
+
+        return get_status()
+
+    if current_state == "HALF_OPEN":
+
+        state["success_count"] = (
+            int(
+                state.get(
+                    "success_count",
+                    0,
+                )
+            )
+            + 1
+        )
+
+        threshold = config[
+            "recovery_success_threshold"
+        ]
+
+        if (
+            state["success_count"]
+            >= threshold
         ):
 
-            half_open_circuit()
-
-            return (
-                False,
-                "Circuit breaker is HALF_OPEN. "
-                "Waiting for a successful health check.",
+            state = transition_to_closed(
+                state,
+                reason=(
+                    "Recovered after "
+                    f"{state['success_count']} "
+                    "successful checks."
+                ),
             )
 
-        return (
-            False,
-            "Circuit breaker is OPEN. "
-            f"Predictions are blocked. "
-            f"Reason: {state.get('reason')}",
-        )
+        else:
 
-    # --------------------------------------------------------
-    # HALF_OPEN
-    # --------------------------------------------------------
-
-    if current_state == HALF_OPEN:
-
-        return (
-            False,
-            "Circuit breaker is HALF_OPEN. "
-            "Predictions remain blocked until "
-            "monitoring confirms recovery.",
-        )
-
-    # --------------------------------------------------------
-    # UNKNOWN STATE
-    # --------------------------------------------------------
-
-    return (
-        False,
-        "Circuit breaker is in an unknown state. "
-        "Predictions are blocked for safety.",
-    )
-
-
-# ============================================================
-# STATUS
-# ============================================================
-
-def get_status() -> dict[str, Any]:
-    """
-    Return the current circuit breaker status.
-    """
-
-    config = load_circuit_breaker_config()
-
-    state = load_state()
-
-    allowed, message = (
-        can_send_predictions()
-    )
-
-    return {
-        "enabled": bool(
-            config.get(
-                "enabled",
-                True,
+            state["last_reason"] = (
+                "HALF_OPEN recovery check "
+                f"{state['success_count']}/"
+                f"{threshold} successful."
             )
-        ),
-        "state": state.get(
-            "state"
-        ),
-        "predictions_allowed": allowed,
-        "message": message,
-        "failure_count": state.get(
-            "failure_count"
-        ),
-        "opened_at": state.get(
-            "opened_at"
-        ),
-        "last_failure_at": state.get(
-            "last_failure_at"
-        ),
-        "last_success_at": state.get(
-            "last_success_at"
-        ),
-        "last_health_score": state.get(
-            "last_health_score"
-        ),
-        "last_health_status": state.get(
-            "last_health_status"
-        ),
-        "reason": state.get(
-            "reason"
-        ),
-        "updated_at": state.get(
-            "updated_at"
-        ),
-    }
 
+        save_state(
+            state
+        )
 
-# ============================================================
-# MANUAL RESET
-# ============================================================
+        return get_status()
 
-def reset_circuit() -> dict[str, Any]:
-    """
-    Manually reset the circuit breaker.
-
-    Useful for emergency recovery or manual operator control.
-    """
-
-    return close_circuit(
-        reason=(
-            "Manual circuit breaker reset."
-        ),
-        health_score=None,
-        health_status="UNKNOWN",
+    save_state(
+        state
     )
+
+    return get_status()
+
+
+# ============================================================
+# RESET
+# ============================================================
+
+def reset_circuit_breaker() -> dict[str, Any]:
+    """
+    Manually reset the circuit breaker to CLOSED.
+    """
+
+    state = default_state()
+
+    state["last_reason"] = (
+        "Manual reset."
+    )
+
+    save_state(
+        state
+    )
+
+    return get_status()
 
 
 # ============================================================
@@ -1129,94 +944,54 @@ def reset_circuit() -> dict[str, Any]:
 # ============================================================
 
 def main() -> int:
-    """
-    Command-line interface.
+    """Display circuit breaker status."""
 
-    Examples
-    --------
-
-    Show status:
-
-        python src/circuit_breaker.py
-
-    Open:
-
-        python src/circuit_breaker.py open
-
-    Close:
-
-        python src/circuit_breaker.py close
-
-    Reset:
-
-        python src/circuit_breaker.py reset
-    """
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format=(
-            "%(asctime)s | "
-            "%(levelname)s | "
-            "%(name)s | "
-            "%(message)s"
-        ),
-    )
-
-    import sys
-
-    command = (
-        sys.argv[1].strip().lower()
-        if len(sys.argv) > 1
-        else "status"
-    )
-
-    if command == "open":
-
-        result = open_circuit(
-            reason="Manual CLI open."
-        )
-
-    elif command == "close":
-
-        result = close_circuit(
-            reason="Manual CLI close."
-        )
-
-    elif command == "reset":
-
-        result = reset_circuit()
-
-    elif command == "status":
-
-        result = get_status()
-
-    else:
-
-        print(
-            "Unknown command."
-        )
-
-        print(
-            "Usage: "
-            "python src/circuit_breaker.py "
-            "[status|open|close|reset]"
-        )
-
-        return 1
+    status = get_status()
 
     print()
 
-    print("=" * 60)
+    print("=" * 70)
 
-    print("CIRCUIT BREAKER STATUS")
+    print("CIRCUIT BREAKER")
 
-    print("=" * 60)
+    print("=" * 70)
 
-    for key, value in result.items():
+    print(
+        f"State: "
+        f"{status.get('state')}"
+    )
 
-        print(
-            f"{key}: {value}"
-        )
+    print(
+        f"Predictions Allowed: "
+        f"{status.get('predictions_allowed')}"
+    )
+
+    print(
+        f"Failure Count: "
+        f"{status.get('failure_count')}"
+    )
+
+    print(
+        f"Success Count: "
+        f"{status.get('success_count')}"
+    )
+
+    print(
+        f"Health Score: "
+        f"{status.get('health_score')}"
+    )
+
+    print(
+        f"Health Status: "
+        f"{status.get('health_status')}"
+    )
+
+    print(
+        f"Reason: "
+        f"{status.get('reason')}"
+    )
+
+    print()
 
     return 0
 
