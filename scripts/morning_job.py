@@ -7,19 +7,36 @@ Pipeline
 --------
 1. Run market prediction pipeline.
 2. Generate ranked opportunities.
-3. Save predictions to the prediction ledger.
-4. Run production monitoring.
-5. Check the circuit breaker.
-6. Send predictions to Telegram only when allowed.
+3. Generate stable prediction_id values.
+4. Safely update the prediction ledger.
+5. Run production monitoring.
+6. Check the circuit breaker.
+7. Send predictions to Telegram only when allowed.
 
-Important:
-----------
+Important
+---------
 A circuit breaker block does NOT stop prediction generation
 or ledger recording. It only blocks Telegram delivery.
+
+Ledger identity
+---------------
+Every prediction receives a stable prediction_id.
+
+The ID is generated from:
+
+    market_date
+    symbol
+    model_version
+
+The prediction ledger is updated using prediction_id.
+
+Duplicate prediction records are prevented by checking
+prediction_id before inserting new rows.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import sys
@@ -92,12 +109,15 @@ def object_to_dict(
         return dict(value)
 
     if hasattr(value, "items"):
+
         try:
             return dict(value.items())
+
         except Exception:
             pass
 
     if hasattr(value, "__dict__"):
+
         return {
             key: item
             for key, item in vars(value).items()
@@ -113,6 +133,7 @@ def load_config() -> Any:
     """
 
     try:
+
         from src.config import cfg
 
         return cfg
@@ -148,14 +169,18 @@ def ensure_dataframe(
         return value.to_frame().T
 
     if isinstance(value, list):
+
         try:
             return pd.DataFrame(value)
+
         except Exception:
             return pd.DataFrame()
 
     if isinstance(value, dict):
+
         try:
             return pd.DataFrame([value])
+
         except Exception:
             return pd.DataFrame()
 
@@ -178,6 +203,230 @@ def find_column(
     return None
 
 
+def normalize_value(
+    value: Any,
+) -> str:
+    """
+    Normalize a value for stable ID generation.
+    """
+
+    if value is None:
+        return ""
+
+    try:
+
+        if pd.isna(value):
+            return ""
+
+    except Exception:
+        pass
+
+    return str(value).strip()
+
+
+# ============================================================
+# PREDICTION ID
+# ============================================================
+
+def get_prediction_identity_values(
+    row: pd.Series,
+) -> tuple[str, str, str]:
+    """
+    Extract stable identity values from a prediction row.
+
+    Returns:
+
+        market_date
+        symbol
+        model_version
+    """
+
+    # --------------------------------------------------------
+    # MARKET DATE
+    # --------------------------------------------------------
+
+    market_date = ""
+
+    for column in [
+        "market_date",
+        "prediction_date",
+        "date",
+    ]:
+
+        if column in row.index:
+
+            value = normalize_value(
+                row.get(column)
+            )
+
+            if value:
+                try:
+
+                    parsed = pd.to_datetime(
+                        value,
+                        errors="coerce",
+                    )
+
+                    if pd.notna(parsed):
+
+                        market_date = (
+                            parsed.strftime(
+                                "%Y-%m-%d"
+                            )
+                        )
+
+                        break
+
+                except Exception:
+                    pass
+
+                market_date = value
+
+                break
+
+    if not market_date:
+
+        market_date = utc_now().strftime(
+            "%Y-%m-%d"
+        )
+
+    # --------------------------------------------------------
+    # SYMBOL
+    # --------------------------------------------------------
+
+    symbol = ""
+
+    for column in [
+        "symbol",
+        "ticker",
+        "stock",
+    ]:
+
+        if column in row.index:
+
+            value = normalize_value(
+                row.get(column)
+            ).upper()
+
+            if value:
+
+                symbol = value
+
+                break
+
+    # --------------------------------------------------------
+    # MODEL VERSION
+    # --------------------------------------------------------
+
+    model_version = ""
+
+    for column in [
+        "model_version",
+        "model_name",
+        "model",
+    ]:
+
+        if column in row.index:
+
+            value = normalize_value(
+                row.get(column)
+            )
+
+            if value:
+
+                model_version = value
+
+                break
+
+    if not model_version:
+
+        model_version = "default"
+
+    return (
+        market_date,
+        symbol,
+        model_version,
+    )
+
+
+def generate_prediction_id(
+    row: pd.Series,
+) -> str:
+    """
+    Generate a deterministic stable prediction ID.
+
+    Identity:
+
+        market_date | symbol | model_version
+
+    Example:
+
+        2026-08-22|RELIANCE|default
+
+    The same identity always produces the same ID.
+    """
+
+    (
+        market_date,
+        symbol,
+        model_version,
+    ) = get_prediction_identity_values(
+        row
+    )
+
+    raw_value = (
+        f"{market_date}|"
+        f"{symbol}|"
+        f"{model_version}"
+    )
+
+    return hashlib.sha256(
+        raw_value.encode("utf-8")
+    ).hexdigest()[:24]
+
+
+def ensure_prediction_ids(
+    predictions: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Ensure every prediction contains prediction_id.
+
+    Existing IDs are preserved.
+    Missing IDs are generated.
+    """
+
+    frame = predictions.copy()
+
+    if frame.empty:
+        return frame
+
+    if "prediction_id" not in frame.columns:
+
+        frame["prediction_id"] = pd.NA
+
+    for index in frame.index:
+
+        current_id = frame.at[
+            index,
+            "prediction_id",
+        ]
+
+        if (
+            pd.notna(current_id)
+            and str(current_id).strip()
+        ):
+            continue
+
+        frame.at[
+            index,
+            "prediction_id",
+        ] = generate_prediction_id(
+            frame.loc[index]
+        )
+
+    return frame
+
+
 # ============================================================
 # PIPELINE EXECUTION
 # ============================================================
@@ -193,7 +442,6 @@ def run_prediction_pipeline() -> pd.DataFrame:
 
         src.pipeline.run_pipeline()
         src.pipeline.run()
-        src.pipeline.main()
 
         src.prediction_pipeline.run_pipeline()
         src.prediction_pipeline.run()
@@ -381,7 +629,7 @@ def select_top_opportunities(
 
 
 # ============================================================
-# LEDGER
+# LEDGER PATH
 # ============================================================
 
 def get_ledger_path() -> Path:
@@ -391,7 +639,36 @@ def get_ledger_path() -> Path:
 
     cfg = load_config()
 
-    candidates = []
+    candidates: list[Any] = []
+
+    # --------------------------------------------------------
+    # ledger
+    # --------------------------------------------------------
+
+    ledger_section = getattr(
+        cfg,
+        "ledger",
+        None,
+    )
+
+    ledger_values = object_to_dict(
+        ledger_section
+    )
+
+    for key in [
+        "path",
+        "prediction_ledger",
+        "ledger",
+    ]:
+
+        value = ledger_values.get(key)
+
+        if value:
+            candidates.append(value)
+
+    # --------------------------------------------------------
+    # data
+    # --------------------------------------------------------
 
     data_section = getattr(
         cfg,
@@ -399,21 +676,23 @@ def get_ledger_path() -> Path:
         None,
     )
 
-    if data_section is not None:
+    data_values = object_to_dict(
+        data_section
+    )
 
-        data_values = object_to_dict(
-            data_section
-        )
+    for key in [
+        "prediction_ledger",
+        "ledger",
+    ]:
 
-        for key in [
-            "prediction_ledger",
-            "ledger",
-        ]:
+        value = data_values.get(key)
 
-            if key in data_values:
-                candidates.append(
-                    data_values[key]
-                )
+        if value:
+            candidates.append(value)
+
+    # --------------------------------------------------------
+    # paths
+    # --------------------------------------------------------
 
     paths_section = getattr(
         cfg,
@@ -421,37 +700,35 @@ def get_ledger_path() -> Path:
         None,
     )
 
-    if paths_section is not None:
+    path_values = object_to_dict(
+        paths_section
+    )
 
-        path_values = object_to_dict(
-            paths_section
-        )
+    for key in [
+        "prediction_ledger",
+        "ledger",
+    ]:
 
-        for key in [
-            "prediction_ledger",
-            "ledger",
-        ]:
+        value = path_values.get(key)
 
-            if key in path_values:
-                candidates.append(
-                    path_values[key]
-                )
+        if value:
+            candidates.append(value)
+
+    # --------------------------------------------------------
+    # Resolve first valid candidate.
+    # --------------------------------------------------------
 
     for candidate in candidates:
 
-        if candidate:
+        path = Path(
+            str(candidate)
+        )
 
-            path = Path(
-                str(candidate)
-            )
+        if not path.is_absolute():
 
-            if not path.is_absolute():
+            path = PROJECT_ROOT / path
 
-                path = (
-                    PROJECT_ROOT / path
-                )
-
-            return path
+        return path
 
     return (
         PROJECT_ROOT
@@ -461,11 +738,25 @@ def get_ledger_path() -> Path:
     )
 
 
+# ============================================================
+# LEDGER PREPARATION
+# ============================================================
+
 def prepare_ledger_records(
     predictions: pd.DataFrame,
 ) -> pd.DataFrame:
     """
     Prepare prediction records for the evaluation ledger.
+
+    Adds:
+
+        prediction_date
+        created_at
+        evaluation_status
+        actual_return
+        actual_direction
+        actual_risk
+        prediction_id
     """
 
     frame = predictions.copy()
@@ -475,46 +766,312 @@ def prepare_ledger_records(
 
     now = utc_now_iso()
 
+    # --------------------------------------------------------
+    # MARKET DATE
+    # --------------------------------------------------------
+
+    if "market_date" not in frame.columns:
+
+        frame["market_date"] = (
+            utc_now().strftime(
+                "%Y-%m-%d"
+            )
+        )
+
+    # --------------------------------------------------------
+    # PREDICTION DATE
+    # --------------------------------------------------------
+
     if "prediction_date" not in frame.columns:
 
         frame["prediction_date"] = now
+
+    # --------------------------------------------------------
+    # CREATED AT
+    # --------------------------------------------------------
 
     if "created_at" not in frame.columns:
 
         frame["created_at"] = now
 
+    # --------------------------------------------------------
+    # EVALUATION STATUS
+    # --------------------------------------------------------
+
     if "evaluation_status" not in frame.columns:
 
-        frame["evaluation_status"] = "PENDING"
+        frame["evaluation_status"] = (
+            "PENDING"
+        )
+
+    # --------------------------------------------------------
+    # ACTUAL RETURN
+    # --------------------------------------------------------
 
     if "actual_return" not in frame.columns:
 
         frame["actual_return"] = pd.NA
 
+    # --------------------------------------------------------
+    # ACTUAL DIRECTION
+    # --------------------------------------------------------
+
     if "actual_direction" not in frame.columns:
 
         frame["actual_direction"] = pd.NA
+
+    # --------------------------------------------------------
+    # ACTUAL RISK
+    # --------------------------------------------------------
 
     if "actual_risk" not in frame.columns:
 
         frame["actual_risk"] = pd.NA
 
+    # --------------------------------------------------------
+    # GENERATE STABLE IDS
+    # --------------------------------------------------------
+
+    frame = ensure_prediction_ids(
+        frame
+    )
+
     return frame
 
 
-def append_to_ledger(
-    predictions: pd.DataFrame,
-) -> Path:
+# ============================================================
+# LEDGER LOAD
+# ============================================================
+
+def load_existing_ledger(
+    path: Path,
+) -> pd.DataFrame:
     """
-    Append predictions to the persistent prediction ledger.
+    Load the existing prediction ledger.
+
+    Old records are automatically upgraded with
+    prediction_id when missing.
     """
 
-    path = get_ledger_path()
+    if not path.exists():
+
+        return pd.DataFrame()
+
+    try:
+
+        ledger = pd.read_csv(path)
+
+    except pd.errors.EmptyDataError:
+
+        return pd.DataFrame()
+
+    except Exception as error:
+
+        raise RuntimeError(
+            f"Could not load prediction ledger: "
+            f"{error}"
+        ) from error
+
+    if ledger.empty:
+        return ledger
+
+    ledger = ensure_prediction_ids(
+        ledger
+    )
+
+    return ledger
+
+
+# ============================================================
+# LEDGER UPDATE
+# ============================================================
+
+def merge_new_predictions(
+    existing: pd.DataFrame,
+    new_predictions: pd.DataFrame,
+) -> tuple[
+    pd.DataFrame,
+    int,
+]:
+    """
+    Merge new predictions into the ledger.
+
+    The merge key is prediction_id.
+
+    Existing predictions are preserved.
+
+    New predictions with an existing prediction_id
+    are NOT duplicated.
+
+    Returns:
+
+        updated_ledger
+        inserted_count
+    """
+
+    new_records = ensure_prediction_ids(
+        new_predictions
+    )
+
+    if new_records.empty:
+
+        return (
+            existing.copy(),
+            0,
+        )
+
+    # --------------------------------------------------------
+    # Remove duplicates inside the new batch.
+    # --------------------------------------------------------
+
+    new_records = (
+        new_records
+        .drop_duplicates(
+            subset=["prediction_id"],
+            keep="first",
+        )
+        .copy()
+    )
+
+    # --------------------------------------------------------
+    # No existing ledger.
+    # --------------------------------------------------------
+
+    if existing.empty:
+
+        return (
+            new_records.reset_index(
+                drop=True
+            ),
+            len(new_records),
+        )
+
+    existing_records = ensure_prediction_ids(
+        existing
+    )
+
+    existing_ids = set(
+        existing_records[
+            "prediction_id"
+        ]
+        .dropna()
+        .astype(str)
+        .str.strip()
+    )
+
+    # --------------------------------------------------------
+    # Only insert genuinely new predictions.
+    # --------------------------------------------------------
+
+    insert_mask = ~(
+        new_records[
+            "prediction_id"
+        ]
+        .astype(str)
+        .str.strip()
+        .isin(existing_ids)
+    )
+
+    records_to_insert = (
+        new_records
+        .loc[insert_mask]
+        .copy()
+    )
+
+    inserted_count = len(
+        records_to_insert
+    )
+
+    if records_to_insert.empty:
+
+        return (
+            existing_records.reset_index(
+                drop=True
+            ),
+            0,
+        )
+
+    # --------------------------------------------------------
+    # Preserve all columns from both DataFrames.
+    # --------------------------------------------------------
+
+    updated = pd.concat(
+        [
+            existing_records,
+            records_to_insert,
+        ],
+        ignore_index=True,
+        sort=False,
+    )
+
+    return (
+        updated,
+        inserted_count,
+    )
+
+
+def save_ledger(
+    ledger: pd.DataFrame,
+    path: Path,
+) -> Path:
+    """
+    Save the complete prediction ledger safely.
+    """
 
     path.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
+
+    temp_path = path.with_suffix(
+        path.suffix + ".tmp"
+    )
+
+    ledger.to_csv(
+        temp_path,
+        index=False,
+    )
+
+    temp_path.replace(
+        path
+    )
+
+    logger.info(
+        "Prediction ledger saved: %s",
+        path,
+    )
+
+    return path
+
+
+def append_to_ledger(
+    predictions: pd.DataFrame,
+) -> tuple[
+    Path,
+    int,
+]:
+    """
+    Safely update the persistent prediction ledger.
+
+    Despite the historical function name, this does NOT
+    blindly append rows.
+
+    Process:
+
+        1. Load existing ledger.
+        2. Upgrade old records with prediction_id.
+        3. Prepare new records.
+        4. Remove duplicate prediction_id values.
+        5. Insert only new predictions.
+        6. Atomically save the complete ledger.
+
+    Returns:
+
+        ledger_path
+        inserted_count
+    """
+
+    path = get_ledger_path()
 
     records = prepare_ledger_records(
         predictions
@@ -523,39 +1080,45 @@ def append_to_ledger(
     if records.empty:
 
         logger.warning(
-            "No prediction records to append "
+            "No prediction records to write "
             "to the ledger."
         )
 
-        return path
-
-    file_exists = path.exists()
-
-    try:
-
-        records.to_csv(
+        return (
             path,
-            mode="a",
-            header=not file_exists,
-            index=False,
+            0,
         )
 
-    except Exception as error:
+    existing = load_existing_ledger(
+        path
+    )
 
-        logger.error(
-            "Could not update prediction ledger: %s",
-            error,
+    updated_ledger, inserted_count = (
+        merge_new_predictions(
+            existing,
+            records,
         )
+    )
 
-        raise
-
-    logger.info(
-        "Added %s prediction(s) to ledger: %s",
-        len(records),
+    # Save even if inserted_count == 0 because
+    # existing records may have been upgraded with IDs.
+    save_ledger(
+        updated_ledger,
         path,
     )
 
-    return path
+    logger.info(
+        "Ledger update complete | "
+        "new_predictions=%s | "
+        "total_records=%s",
+        inserted_count,
+        len(updated_ledger),
+    )
+
+    return (
+        path,
+        inserted_count,
+    )
 
 
 # ============================================================
@@ -579,7 +1142,10 @@ def run_production_monitoring() -> dict[str, Any]:
 
         result = run_monitoring()
 
-        if not isinstance(result, dict):
+        if not isinstance(
+            result,
+            dict,
+        ):
 
             return {
                 "status": "UNKNOWN",
@@ -599,7 +1165,6 @@ def run_production_monitoring() -> dict[str, Any]:
             "Production monitoring failed."
         )
 
-        # Fail-safe result.
         return {
             "status": "ERROR",
             "health_status": "CRITICAL",
@@ -668,7 +1233,6 @@ def check_circuit_breaker() -> tuple[
             "Circuit breaker check failed."
         )
 
-        # Fail closed.
         return (
             False,
             (
@@ -786,7 +1350,7 @@ def format_prediction_message(
         "📈 TOP MARKET OPPORTUNITIES",
         "",
         (
-            f"Generated: "
+            "Generated: "
             f"{datetime.now().strftime('%Y-%m-%d %H:%M')}"
         ),
         "",
@@ -844,9 +1408,10 @@ def format_prediction_message(
         ],
     )
 
-    for index, row in predictions.iterrows():
-
-        rank = index + 1
+    for position, (_, row) in enumerate(
+        predictions.iterrows(),
+        start=1,
+    ):
 
         symbol = (
             str(
@@ -860,15 +1425,13 @@ def format_prediction_message(
         )
 
         lines.append(
-            f"{rank}. {symbol}"
+            f"{position}. {symbol}"
         )
 
         if return_column:
 
             value = format_number(
-                row.get(
-                    return_column
-                ),
+                row.get(return_column),
                 decimals=2,
                 suffix="%",
             )
@@ -956,9 +1519,7 @@ def format_prediction_message(
                 ]
             )
 
-    return "\n".join(
-        lines
-    )
+    return "\n".join(lines)
 
 
 # ============================================================
@@ -1021,7 +1582,6 @@ def send_telegram_message(
         )
 
         if result is None:
-
             return True
 
         return bool(result)
@@ -1090,6 +1650,7 @@ def run_morning_job() -> dict[str, Any]:
         "status": "STARTED",
         "predictions_generated": 0,
         "top_predictions": 0,
+        "ledger_predictions_inserted": 0,
         "ledger_updated": False,
         "telegram_sent": False,
         "telegram_blocked": False,
@@ -1126,9 +1687,7 @@ def run_morning_job() -> dict[str, Any]:
 
         result[
             "predictions_generated"
-        ] = len(
-            predictions
-        )
+        ] = len(predictions)
 
         logger.info(
             "Generated %s prediction(s).",
@@ -1162,21 +1721,40 @@ def run_morning_job() -> dict[str, Any]:
 
         result[
             "top_predictions"
-        ] = len(
-            top_predictions
-        )
+        ] = len(top_predictions)
 
         # ----------------------------------------------------
-        # STEP 3: UPDATE LEDGER
+        # STEP 3: PREPARE STABLE IDENTITIES
         # ----------------------------------------------------
 
         logger.info(
-            "Step 3: Updating prediction ledger."
+            "Step 3: Generating stable prediction IDs."
         )
 
-        ledger_path = append_to_ledger(
+        top_predictions = (
+            prepare_ledger_records(
+                top_predictions
+            )
+        )
+
+        # ----------------------------------------------------
+        # STEP 4: UPDATE LEDGER
+        # ----------------------------------------------------
+
+        logger.info(
+            "Step 4: Updating prediction ledger."
+        )
+
+        (
+            ledger_path,
+            inserted_count,
+        ) = append_to_ledger(
             top_predictions
         )
+
+        result[
+            "ledger_predictions_inserted"
+        ] = inserted_count
 
         result["ledger_updated"] = True
 
@@ -1185,11 +1763,11 @@ def run_morning_job() -> dict[str, Any]:
         )
 
         # ----------------------------------------------------
-        # STEP 4: RUN MONITORING
+        # STEP 5: RUN MONITORING
         # ----------------------------------------------------
 
         logger.info(
-            "Step 4: Running production monitoring."
+            "Step 5: Running production monitoring."
         )
 
         monitoring = (
@@ -1201,23 +1779,25 @@ def run_morning_job() -> dict[str, Any]:
         ] = monitoring
 
         # ----------------------------------------------------
-        # STEP 5: CHECK CIRCUIT BREAKER
+        # STEP 6: CHECK CIRCUIT BREAKER
         # ----------------------------------------------------
 
         logger.info(
-            "Step 5: Checking circuit breaker."
+            "Step 6: Checking circuit breaker."
         )
 
-        allowed, reason, breaker_status = (
-            check_circuit_breaker()
-        )
+        (
+            allowed,
+            reason,
+            breaker_status,
+        ) = check_circuit_breaker()
 
         result[
             "circuit_breaker"
         ] = breaker_status
 
         # ----------------------------------------------------
-        # STEP 6: BLOCK OR SEND TELEGRAM
+        # STEP 7: BLOCK OR SEND TELEGRAM
         # ----------------------------------------------------
 
         if not allowed:
@@ -1243,13 +1823,14 @@ def run_morning_job() -> dict[str, Any]:
                 "Predictions were generated and "
                 "ledger was updated, but no market "
                 "signals were sent because the "
-                "circuit breaker is not CLOSED."
+                "circuit breaker is not allowing "
+                "delivery."
             )
 
             return result
 
         logger.info(
-            "Step 6: Sending Telegram message."
+            "Step 7: Sending Telegram message."
         )
 
         message = (
@@ -1289,9 +1870,7 @@ def run_morning_job() -> dict[str, Any]:
 
         result["status"] = "FAILED"
 
-        result["error"] = str(
-            error
-        )
+        result["error"] = str(error)
 
         result["traceback"] = (
             traceback.format_exc()
@@ -1375,6 +1954,11 @@ def main() -> int:
     print(
         "Top predictions: "
         f"{result.get('top_predictions')}"
+    )
+
+    print(
+        "New ledger predictions: "
+        f"{result.get('ledger_predictions_inserted')}"
     )
 
     print(
