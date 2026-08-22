@@ -2,9 +2,9 @@
 
 """Morning prediction pipeline.
 
-Phase 3 architecture:
+Phase 3C architecture:
 
-    NSE / Yahoo Data
+    NSE / Yahoo / News
             │
             ▼
       Data Validation
@@ -13,25 +13,25 @@ Phase 3 architecture:
       Market Regime
             │
             ▼
-    Technical / Fundamental
+ Technical / Fundamental Scoring
             │
             ▼
-      Candidate Scoring
+      Candidate Prefilter
             │
             ▼
        Feature Engine
             │
             ▼
-       Multi-Model ML
-       ├── Return ML
-       ├── Direction ML
-       └── Risk ML
+     Load Saved ML Models
+      ├── Return Model
+      ├── Direction Model
+      └── Risk Model
             │
             ▼
          Ensemble
             │
             ▼
-   Opportunity + Confidence
+ Opportunity + Confidence
             │
             ▼
         Quality Gate
@@ -52,8 +52,8 @@ import sys
 import logging
 import traceback
 
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 
@@ -81,30 +81,40 @@ sys.path.insert(
 
 from src.config import cfg
 
-from src.holidays import is_trading_day
+from src.holidays import (
+    is_trading_day,
+)
 
-from src.universe import get_universe_symbols
+from src.universe import (
+    get_universe_symbols,
+)
 
-from src.scoring import select_top5
+from src.scoring import (
+    select_top5,
+)
 
-from src.model import OHLCPredictor
+from src.model import (
+    OHLCPredictor,
+)
 
 from src.ml_pipeline import (
-    MultiModelPipeline,
+    load_and_predict,
+)
+
+from src.model_store import (
+    ModelStore,
 )
 
 from src.sentiment import (
     get_sentiment_engine,
 )
 
-from src.indexes import predict_indexes
+from src.indexes import (
+    predict_indexes,
+)
 
 from src.ipo import (
     ipo_watchlist_telegram_lines,
-)
-
-from src.ipo_gmp import (
-    build_ipo_desk_message,
 )
 
 from src.telegram_utils import (
@@ -146,11 +156,13 @@ logging.basicConfig(
     ),
 )
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(
+    __name__
+)
 
 
 # ============================================================
-# HELPERS
+# CONFIG HELPERS
 # ============================================================
 
 def _uni_label() -> str:
@@ -180,10 +192,134 @@ def _uni_label() -> str:
     return "NIFTY"
 
 
+def get_model_store() -> ModelStore:
+    """Create the persistent model store."""
+
+    try:
+
+        paths = getattr(
+            cfg,
+            "paths",
+            None,
+        )
+
+        model_path = getattr(
+            paths,
+            "models",
+            None,
+        )
+
+        if model_path:
+
+            return ModelStore(
+                base_path=model_path
+            )
+
+    except Exception:
+
+        pass
+
+    return ModelStore(
+        base_path=(
+            PROJECT_ROOT
+            / "data"
+            / "models"
+        )
+    )
+
+
+def get_prefilter_limit() -> int:
+    """Return the number of candidates before ML filtering."""
+
+    try:
+
+        scoring = getattr(
+            cfg,
+            "scoring",
+            None,
+        )
+
+        value = getattr(
+            scoring,
+            "prefilter_top",
+            None,
+        )
+
+        if value:
+
+            return int(
+                value
+            )
+
+    except Exception:
+
+        pass
+
+    return 40
+
+
+def get_top_n() -> int:
+    """Return final number of predictions."""
+
+    try:
+
+        value = getattr(
+            cfg,
+            "top_n",
+            None,
+        )
+
+        if value:
+
+            return int(
+                value
+            )
+
+    except Exception:
+
+        pass
+
+    return 5
+
+
+def get_minimum_feature_quality() -> float:
+    """Return minimum acceptable feature quality."""
+
+    try:
+
+        features = getattr(
+            cfg,
+            "features",
+            None,
+        )
+
+        value = getattr(
+            features,
+            "min_quality_score",
+            None,
+        )
+
+        if value is not None:
+
+            return float(
+                value
+            )
+
+    except Exception:
+
+        pass
+
+    return 0.85
+
+
+# ============================================================
+# DATA HELPERS
+# ============================================================
+
 def get_current_close(
     symbol: str,
 ) -> float | None:
-    """Get latest available close."""
+    """Get latest available closing price."""
 
     try:
 
@@ -224,6 +360,10 @@ def get_current_close(
         return None
 
 
+# ============================================================
+# MARKET REGIME
+# ============================================================
+
 def get_market_regime() -> dict:
     """Detect current market regime."""
 
@@ -235,20 +375,25 @@ def get_market_regime() -> dict:
             None,
         )
 
-        symbol = "^NSEI"
-
-        if regime_config:
-
-            symbol = getattr(
-                regime_config,
-                "symbol",
-                "^NSEI",
-            )
+        symbol = getattr(
+            regime_config,
+            "symbol",
+            "^NSEI",
+        )
 
         history = download_history(
             symbol,
             period="1y",
         )
+
+        if (
+            history is None
+            or history.empty
+        ):
+
+            raise ValueError(
+                "No market index history."
+            )
 
         regime = detect_market_regime(
             history
@@ -260,9 +405,11 @@ def get_market_regime() -> dict:
                 "regime",
                 "UNKNOWN",
             ),
-            regime.get(
-                "score",
-                0.0,
+            float(
+                regime.get(
+                    "score",
+                    0.0,
+                )
             ),
         )
 
@@ -282,10 +429,14 @@ def get_market_regime() -> dict:
         }
 
 
+# ============================================================
+# FEATURE ENGINE
+# ============================================================
+
 def build_stock_features(
     symbol: str,
 ) -> dict:
-    """Build Phase 2 feature metadata."""
+    """Build latest features and calculate feature quality."""
 
     try:
 
@@ -294,9 +445,26 @@ def build_stock_features(
             period="1y",
         )
 
+        if (
+            history is None
+            or history.empty
+        ):
+
+            return {
+                "features": None,
+                "quality": 0.0,
+            }
+
         features = latest_features(
             history
         )
+
+        if not features:
+
+            return {
+                "features": None,
+                "quality": 0.0,
+            }
 
         quality = feature_quality_score(
             features
@@ -304,7 +472,9 @@ def build_stock_features(
 
         return {
             "features": features,
-            "quality": float(quality),
+            "quality": float(
+                quality
+            ),
         }
 
     except Exception as error:
@@ -321,23 +491,32 @@ def build_stock_features(
         }
 
 
+# ============================================================
+# SAVED MODEL INFERENCE
+# ============================================================
+
 def get_ml_prediction(
     symbol: str,
+    store: ModelStore,
 ) -> dict | None:
-    """Train and run Phase 3 multi-model prediction.
-
-    Current implementation trains using the
-    stock's historical data.
-
-    Future Phase 4 can replace this with
-    persisted models and scheduled retraining.
-    """
+    """Load saved model and generate prediction."""
 
     try:
 
+        if not store.exists(
+            symbol
+        ):
+
+            logger.warning(
+                "No saved model found for %s",
+                symbol,
+            )
+
+            return None
+
         history = download_history(
             symbol,
-            period="2y",
+            period="1y",
         )
 
         if (
@@ -346,45 +525,54 @@ def get_ml_prediction(
         ):
 
             logger.warning(
-                "No ML history for %s",
+                "No prediction history for %s",
                 symbol,
             )
 
             return None
 
-        pipeline = MultiModelPipeline()
+        prediction = load_and_predict(
 
-        pipeline.fit(
-            history
-        )
+            symbol=symbol,
 
-        prediction = pipeline.predict(
-            history
+            history=history,
+
+            store=store,
         )
 
         if prediction:
 
             logger.info(
-                "%s ML | return=%+.4f | "
-                "P(up)=%.2f | risk=%.4f | "
-                "opp=%.2f | conf=%.2f",
+
+                "%s ML INFERENCE | "
+                "return=%+.4f | "
+                "P(up)=%.2f | "
+                "risk=%.4f | "
+                "opp=%.2f | "
+                "conf=%.2f",
+
                 symbol,
+
                 prediction.get(
                     "expected_return",
                     0.0,
                 ),
+
                 prediction.get(
                     "probability_up",
                     0.5,
                 ),
+
                 prediction.get(
                     "expected_risk",
                     0.0,
                 ),
+
                 prediction.get(
                     "opportunity_score",
                     0.0,
                 ),
+
                 prediction.get(
                     "confidence",
                     0.0,
@@ -396,7 +584,7 @@ def get_ml_prediction(
     except Exception as error:
 
         logger.warning(
-            "ML prediction failed for %s: %s",
+            "ML inference failed for %s: %s",
             symbol,
             error,
         )
@@ -404,87 +592,57 @@ def get_ml_prediction(
         return None
 
 
+# ============================================================
+# SCORING
+# ============================================================
+
 def calculate_final_score(
     technical_score: float,
     opportunity_score: float,
     confidence: float,
     feature_quality: float,
 ) -> float:
-    """Calculate final Phase 3 ranking score.
+    """Combine traditional and ML scores."""
 
-    We combine:
+    def normalize(
+        value: float,
+    ) -> float:
 
-    - Existing technical/fundamental score
-    - ML opportunity score
-    - ML confidence
-    - Feature data quality
-    """
-
-    technical_score = float(
-        technical_score
-        if technical_score is not None
-        else 0.0
-    )
-
-    opportunity_score = float(
-        opportunity_score
-        if opportunity_score is not None
-        else 0.0
-    )
-
-    confidence = float(
-        confidence
-        if confidence is not None
-        else 0.0
-    )
-
-    feature_quality = float(
-        feature_quality
-        if feature_quality is not None
-        else 0.0
-    )
-
-    # Normalize legacy score if it is
-    # on a 0-100 scale.
-    if technical_score > 1.0:
-
-        technical_score = (
-            technical_score / 100.0
+        value = float(
+            value
+            if value is not None
+            else 0.0
         )
 
-    technical_score = max(
-        0.0,
-        min(
-            1.0,
-            technical_score,
-        ),
+        if value > 1.0:
+
+            value = value / 100.0
+
+        return max(
+            0.0,
+            min(
+                1.0,
+                value,
+            ),
+        )
+
+    technical_score = normalize(
+        technical_score
     )
 
-    opportunity_score = max(
-        0.0,
-        min(
-            1.0,
-            opportunity_score,
-        ),
+    opportunity_score = normalize(
+        opportunity_score
     )
 
-    confidence = max(
-        0.0,
-        min(
-            1.0,
-            confidence,
-        ),
+    confidence = normalize(
+        confidence
     )
 
-    feature_quality = max(
-        0.0,
-        min(
-            1.0,
-            feature_quality,
-        ),
+    feature_quality = normalize(
+        feature_quality
     )
 
-    final_score = (
+    score = (
 
         0.25
         * technical_score
@@ -500,7 +658,7 @@ def calculate_final_score(
     )
 
     return round(
-        final_score,
+        score,
         6,
     )
 
@@ -510,11 +668,7 @@ def apply_market_regime_adjustment(
     prediction: dict,
     regime: dict,
 ) -> float:
-    """Adjust final score using market regime."""
-
-    if not prediction:
-
-        return score
+    """Adjust score based on market regime."""
 
     regime_name = str(
         regime.get(
@@ -530,9 +684,10 @@ def apply_market_regime_adjustment(
         )
     ).upper()
 
-    adjusted = float(score)
+    adjusted = float(
+        score
+    )
 
-    # Bullish market favors UP signals.
     if regime_name in (
         "BULLISH",
         "STRONG_BULLISH",
@@ -546,7 +701,6 @@ def apply_market_regime_adjustment(
 
             adjusted *= 0.90
 
-    # Bearish market penalizes long signals.
     elif regime_name in (
         "BEARISH",
         "STRONG_BEARISH",
@@ -572,11 +726,15 @@ def apply_market_regime_adjustment(
     )
 
 
+# ============================================================
+# QUALITY GATE
+# ============================================================
+
 def quality_gate(
     candidate: dict,
     minimum_feature_quality: float,
 ) -> bool:
-    """Final quality gate before Top 5."""
+    """Reject weak candidates before final ranking."""
 
     prediction = candidate.get(
         "ml_prediction"
@@ -607,7 +765,6 @@ def quality_gate(
         )
     )
 
-    # Required feature quality.
     if (
         feature_quality
         < minimum_feature_quality
@@ -615,12 +772,10 @@ def quality_gate(
 
         return False
 
-    # Reject very weak ML confidence.
     if confidence < 0.20:
 
         return False
 
-    # Reject very poor opportunity.
     if opportunity_score < 0.20:
 
         return False
@@ -629,10 +784,10 @@ def quality_gate(
 
 
 # ============================================================
-# MAIN PIPELINE
+# MAIN
 # ============================================================
 
-def main():
+def main() -> int:
 
     start = datetime.now()
 
@@ -640,19 +795,23 @@ def main():
         "%Y-%m-%d"
     )
 
-    logger.info("=" * 70)
+    logger.info(
+        "=" * 70
+    )
 
     logger.info(
-        "PHASE 3 MORNING JOB STARTED: %s",
+        "PHASE 3C MORNING JOB STARTED: %s",
         today,
     )
 
-    logger.info("=" * 70)
+    logger.info(
+        "=" * 70
+    )
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # TRADING DAY CHECK
-    # --------------------------------------------------------
+    # ========================================================
 
     if not is_trading_day():
 
@@ -660,7 +819,7 @@ def main():
             "Not a trading day."
         )
 
-        return
+        return 0
 
 
     try:
@@ -677,18 +836,18 @@ def main():
             get_universe_symbols()
         )
 
+        if not symbols:
+
+            logger.error(
+                "Stock universe is empty."
+            )
+
+            return 1
+
         logger.info(
             "Universe size: %s",
             len(symbols),
         )
-
-        if not symbols:
-
-            send_telegram(
-                "⚠️ Stock universe is empty."
-            )
-
-            return
 
 
         # ====================================================
@@ -701,28 +860,57 @@ def main():
 
 
         # ====================================================
-        # STEP 3 — INITIAL CANDIDATE SCORING
+        # STEP 3 — MODEL STORE
         # ====================================================
 
-        logger.info(
-            "Running candidate selection..."
+        model_store = (
+            get_model_store()
         )
 
-        initial_limit = int(
-            getattr(
-                getattr(
-                    cfg,
-                    "scoring",
-                    None,
-                ),
-                "prefilter_top",
-                40,
+        saved_symbols = (
+            model_store.list_symbols()
+        )
+
+        logger.info(
+            "Model store: %s",
+            model_store.base_path,
+        )
+
+        logger.info(
+            "Saved models available: %s",
+            len(saved_symbols),
+        )
+
+        if not saved_symbols:
+
+            logger.warning(
+                "No saved models found. "
+                "Run scripts/train_models.py first."
             )
+
+            send_telegram(
+                "⚠️ *No trained ML models found.*\n"
+                "Run `scripts/train_models.py` first."
+            )
+
+            return 1
+
+
+        # ====================================================
+        # STEP 4 — INITIAL CANDIDATE SELECTION
+        # ====================================================
+
+        prefilter_limit = (
+            get_prefilter_limit()
+        )
+
+        logger.info(
+            "Running initial candidate scoring..."
         )
 
         candidates = select_top5(
             symbols,
-            initial_limit,
+            prefilter_limit,
         )
 
         if (
@@ -730,11 +918,16 @@ def main():
             or candidates.empty
         ):
 
+            logger.warning(
+                "No candidates found."
+            )
+
             send_telegram(
                 f"⚠️ No candidates for `{today}`"
             )
 
-            return
+            return 0
+
 
         logger.info(
             "Initial candidates: %s",
@@ -743,26 +936,39 @@ def main():
 
 
         # ====================================================
-        # STEP 4 — FEATURE ENGINE
+        # STEP 5 — FEATURE QUALITY FILTER
         # ====================================================
 
-        minimum_quality = float(
-            getattr(
-                getattr(
-                    cfg,
-                    "features",
-                    None,
-                ),
-                "min_quality_score",
-                0.85,
-            )
+        minimum_quality = (
+            get_minimum_feature_quality()
         )
 
-        enriched_candidates = []
+        enriched_candidates: list[
+            dict
+        ] = []
 
         for _, row in candidates.iterrows():
 
-            symbol = row["symbol"]
+            symbol = row.get(
+                "symbol"
+            )
+
+            if not symbol:
+
+                continue
+
+            # Only evaluate stocks with
+            # trained models.
+            if not model_store.exists(
+                symbol
+            ):
+
+                logger.info(
+                    "%s skipped: no saved model",
+                    symbol,
+                )
+
+                continue
 
             metadata = (
                 build_stock_features(
@@ -770,9 +976,10 @@ def main():
                 )
             )
 
-            quality = metadata[
-                "quality"
-            ]
+            quality = metadata.get(
+                "quality",
+                0.0,
+            )
 
             if quality < minimum_quality:
 
@@ -787,7 +994,9 @@ def main():
                 continue
 
             enriched_candidates.append(
+
                 {
+
                     "symbol": symbol,
 
                     "technical_score": float(
@@ -797,10 +1006,14 @@ def main():
                         )
                     ),
 
-                    "feature_quality": quality,
+                    "feature_quality": (
+                        quality
+                    ),
 
-                    "features": metadata.get(
-                        "features"
+                    "features": (
+                        metadata.get(
+                            "features"
+                        )
                     ),
                 }
             )
@@ -808,12 +1021,16 @@ def main():
 
         if not enriched_candidates:
 
+            logger.warning(
+                "No candidates passed feature quality."
+            )
+
             send_telegram(
                 f"⚠️ All candidates failed "
                 f"feature quality for `{today}`"
             )
 
-            return
+            return 0
 
 
         logger.info(
@@ -823,10 +1040,12 @@ def main():
 
 
         # ====================================================
-        # STEP 5 — PHASE 3 MULTI-MODEL ML
+        # STEP 6 — SAVED MODEL INFERENCE
         # ====================================================
 
-        ml_candidates = []
+        ml_candidates: list[
+            dict
+        ] = []
 
         for candidate in enriched_candidates:
 
@@ -836,7 +1055,10 @@ def main():
 
             prediction = (
                 get_ml_prediction(
-                    symbol
+
+                    symbol=symbol,
+
+                    store=model_store,
                 )
             )
 
@@ -906,7 +1128,6 @@ def main():
                 regime=market_regime,
             )
 
-            # Final quality gate.
             if not quality_gate(
                 candidate,
                 minimum_quality,
@@ -927,32 +1148,32 @@ def main():
 
         if not ml_candidates:
 
+            logger.warning(
+                "No ML candidates survived."
+            )
+
             send_telegram(
                 f"⚠️ No ML candidates survived "
                 f"quality gate for `{today}`"
             )
 
-            return
+            return 0
 
 
         # ====================================================
-        # STEP 6 — FINAL RANKING / TOP 5
+        # STEP 7 — FINAL RANKING
         # ====================================================
 
         ml_candidates.sort(
+
             key=lambda item: item[
                 "final_score"
             ],
+
             reverse=True,
         )
 
-        top_n = int(
-            getattr(
-                cfg,
-                "top_n",
-                5,
-            )
-        )
+        top_n = get_top_n()
 
         final_candidates = (
             ml_candidates[:top_n]
@@ -960,9 +1181,13 @@ def main():
 
         logger.info(
             "FINAL TOP %s: %s",
+
             len(final_candidates),
+
             ", ".join(
+
                 item["symbol"]
+
                 for item
                 in final_candidates
             ),
@@ -970,10 +1195,12 @@ def main():
 
 
         # ====================================================
-        # STEP 7 — OHLC PREDICTIONS
+        # STEP 8 — OHLC PREDICTIONS
         # ====================================================
 
-        records = []
+        records: list[
+            dict
+        ] = []
 
         for candidate in final_candidates:
 
@@ -983,8 +1210,10 @@ def main():
 
             try:
 
-                predictor = OHLCPredictor(
-                    symbol
+                predictor = (
+                    OHLCPredictor(
+                        symbol
+                    )
                 )
 
                 ohlc = (
@@ -994,7 +1223,7 @@ def main():
                 if not ohlc:
 
                     logger.warning(
-                        "No OHLC prediction: %s",
+                        "No OHLC prediction for %s",
                         symbol,
                     )
 
@@ -1010,21 +1239,21 @@ def main():
 
                     "symbol": symbol,
 
-                    # Existing score
+                    # Traditional score
                     "technical_score": (
                         candidate[
                             "technical_score"
                         ]
                     ),
 
-                    # Phase 2
+                    # Feature quality
                     "feature_quality": (
                         candidate[
                             "feature_quality"
                         ]
                     ),
 
-                    # Phase 3
+                    # Multi-model outputs
                     "expected_return": (
                         ml.get(
                             "expected_return"
@@ -1085,6 +1314,12 @@ def main():
                         )
                     ),
 
+                    "model_saved_at": (
+                        ml.get(
+                            "model_saved_at"
+                        )
+                    ),
+
                     "market_regime": (
                         market_regime.get(
                             "regime",
@@ -1098,6 +1333,7 @@ def main():
                         ]
                     ),
 
+                    # OHLC prediction
                     **ohlc,
                 }
 
@@ -1117,16 +1353,20 @@ def main():
 
         if not records:
 
+            logger.warning(
+                "No final predictions created."
+            )
+
             send_telegram(
                 f"⚠️ No final predictions "
                 f"for `{today}`"
             )
 
-            return
+            return 0
 
 
         # ====================================================
-        # STEP 8 — SAVE DAILY PREDICTIONS
+        # STEP 9 — SAVE DAILY PREDICTIONS
         # ====================================================
 
         prediction_dir = Path(
@@ -1157,10 +1397,12 @@ def main():
 
 
         # ====================================================
-        # STEP 9 — PREDICTION LEDGER
+        # STEP 10 — PREDICTION LEDGER
         # ====================================================
 
-        ledger_records = []
+        ledger_records: list[
+            dict
+        ] = []
 
         for record in records:
 
@@ -1178,8 +1420,8 @@ def main():
             if not valid:
 
                 logger.warning(
-                    "Prediction validation "
-                    "failed for %s: %s",
+                    "Prediction validation failed "
+                    "for %s: %s",
                     symbol,
                     validation,
                 )
@@ -1192,102 +1434,100 @@ def main():
                 )
             )
 
-            ledger_record = {
-
-                "market_date": today,
-
-                "symbol": symbol,
-
-                "current_close": (
-                    current_close
-                ),
-
-                "predicted_open": float(
-                    record["Open"]
-                ),
-
-                "predicted_high": float(
-                    record["High"]
-                ),
-
-                "predicted_low": float(
-                    record["Low"]
-                ),
-
-                "predicted_close": float(
-                    record["Close"]
-                ),
-
-                # Phase 3 outputs
-                "expected_return": (
-                    record.get(
-                        "expected_return"
-                    )
-                ),
-
-                "probability_up": (
-                    record.get(
-                        "probability_up"
-                    )
-                ),
-
-                "expected_risk": (
-                    record.get(
-                        "expected_risk"
-                    )
-                ),
-
-                "direction": (
-                    record.get(
-                        "direction"
-                    )
-                ),
-
-                "confidence": (
-                    record.get(
-                        "confidence"
-                    )
-                ),
-
-                "opportunity_score": (
-                    record.get(
-                        "opportunity_score"
-                    )
-                ),
-
-                "final_score": (
-                    record.get(
-                        "final_score"
-                    )
-                ),
-
-                "market_regime": (
-                    record.get(
-                        "market_regime"
-                    )
-                ),
-
-                "data_quality_score": (
-                    record.get(
-                        "feature_quality"
-                    )
-                ),
-
-                "feature_version": (
-                    record.get(
-                        "feature_version"
-                    )
-                ),
-
-                "model_version": (
-                    record.get(
-                        "model_version"
-                    )
-                ),
-            }
-
             ledger_records.append(
-                ledger_record
+
+                {
+
+                    "market_date": today,
+
+                    "symbol": symbol,
+
+                    "current_close": (
+                        current_close
+                    ),
+
+                    "predicted_open": float(
+                        record["Open"]
+                    ),
+
+                    "predicted_high": float(
+                        record["High"]
+                    ),
+
+                    "predicted_low": float(
+                        record["Low"]
+                    ),
+
+                    "predicted_close": float(
+                        record["Close"]
+                    ),
+
+                    "expected_return": (
+                        record.get(
+                            "expected_return"
+                        )
+                    ),
+
+                    "probability_up": (
+                        record.get(
+                            "probability_up"
+                        )
+                    ),
+
+                    "expected_risk": (
+                        record.get(
+                            "expected_risk"
+                        )
+                    ),
+
+                    "direction": (
+                        record.get(
+                            "direction"
+                        )
+                    ),
+
+                    "confidence": (
+                        record.get(
+                            "confidence"
+                        )
+                    ),
+
+                    "opportunity_score": (
+                        record.get(
+                            "opportunity_score"
+                        )
+                    ),
+
+                    "final_score": (
+                        record.get(
+                            "final_score"
+                        )
+                    ),
+
+                    "market_regime": (
+                        record.get(
+                            "market_regime"
+                        )
+                    ),
+
+                    "data_quality_score": (
+                        record.get(
+                            "feature_quality"
+                        )
+                    ),
+
+                    "feature_version": (
+                        record.get(
+                            "feature_version"
+                        )
+                    ),
+
+                    "model_version": (
+                        record.get(
+                            "model_version"
+                        )
+                    ),
+                }
             )
 
 
@@ -1298,21 +1538,27 @@ def main():
             )
 
             logger.info(
-                "Ledger records: %s",
+                "Ledger records saved: %s",
                 len(ledger_records),
             )
 
 
         # ====================================================
-        # STEP 10 — SENTIMENT
+        # STEP 11 — NEWS SENTIMENT
         # ====================================================
 
-        sentiments = {}
+        sentiments: dict = {}
 
         try:
 
             engine = (
                 get_sentiment_engine()
+            )
+
+            max_articles = getattr(
+                cfg.sentiment,
+                "max_articles",
+                10,
             )
 
             for record in records:
@@ -1326,14 +1572,15 @@ def main():
                     sentiments[symbol] = (
                         engine.analyze_stock(
                             symbol,
-                            cfg.sentiment.max_articles,
+                            max_articles,
                         )
                     )
 
                 except Exception as error:
 
                     logger.warning(
-                        "Sentiment failed for %s: %s",
+                        "Sentiment failed "
+                        "for %s: %s",
                         symbol,
                         error,
                     )
@@ -1347,10 +1594,8 @@ def main():
 
 
         # ====================================================
-        # STEP 11 — INDEX PREDICTIONS
+        # STEP 12 — INDEX PREDICTIONS
         # ====================================================
-
-        index_predictions = []
 
         try:
 
@@ -1360,28 +1605,30 @@ def main():
                     "indexes",
                     None,
                 )
-                and cfg.indexes.enabled
+                and getattr(
+                    cfg.indexes,
+                    "enabled",
+                    False,
+                )
             ):
 
-                index_predictions = (
-                    predict_indexes()
-                )
+                predict_indexes()
 
         except Exception as error:
 
             logger.warning(
-                "Index predictions failed: %s",
+                "Index prediction failed: %s",
                 error,
             )
 
 
         # ====================================================
-        # STEP 12 — TELEGRAM REPORT
+        # STEP 13 — TELEGRAM REPORT
         # ====================================================
 
         lines = [
 
-            "🚀 *PHASE 3 AI STOCK PREDICTIONS*",
+            "🚀 *AI STOCK PREDICTIONS*",
 
             (
                 f"Date: `{today}` | "
@@ -1418,9 +1665,9 @@ def main():
 
         for record in records:
 
-            symbol = record[
-                "symbol"
-            ].replace(
+            symbol = str(
+                record["symbol"]
+            ).replace(
                 ".NS",
                 "",
             )
@@ -1463,17 +1710,11 @@ def main():
             lines.append(
 
                 f"{symbol:<11} "
-
                 f"{direction:<5} "
-
                 f"{probability_up:>5.0%} "
-
                 f"{expected_return:>+7.2%} "
-
                 f"{expected_risk:>7.2%} "
-
                 f"{final_score:>6.2f}"
-
             )
 
 
@@ -1482,9 +1723,9 @@ def main():
         )
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # OHLC SECTION
-        # ----------------------------------------------------
+        # ====================================================
 
         lines += [
 
@@ -1510,9 +1751,9 @@ def main():
 
         for record in records:
 
-            symbol = record[
-                "symbol"
-            ].replace(
+            symbol = str(
+                record["symbol"]
+            ).replace(
                 ".NS",
                 "",
             )
@@ -1520,15 +1761,10 @@ def main():
             lines.append(
 
                 f"{symbol:<11} "
-
                 f"{float(record['Open']):>9.2f} "
-
                 f"{float(record['High']):>9.2f} "
-
                 f"{float(record['Low']):>9.2f} "
-
                 f"{float(record['Close']):>9.2f}"
-
             )
 
 
@@ -1537,9 +1773,9 @@ def main():
         )
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # MODEL CONFIDENCE
-        # ----------------------------------------------------
+        # ====================================================
 
         lines += [
 
@@ -1552,9 +1788,9 @@ def main():
 
         for record in records:
 
-            symbol = record[
-                "symbol"
-            ].replace(
+            symbol = str(
+                record["symbol"]
+            ).replace(
                 ".NS",
                 "",
             )
@@ -1578,24 +1814,24 @@ def main():
 
                 emoji = "🔴"
 
+            feature_quality = float(
+                record.get(
+                    "feature_quality",
+                    0.0,
+                )
+            )
+
             lines.append(
 
-                f"{emoji} "
-
-                f"{symbol}: "
-
-                f"`{confidence:.0%}` "
-
-                f"| Feature: "
-
-                f"`{float(record.get('feature_quality', 0)):.0%}`"
-
+                f"{emoji} {symbol}: "
+                f"`{confidence:.0%}` | "
+                f"Feature: `{feature_quality:.0%}`"
             )
 
 
-        # ----------------------------------------------------
-        # SENTIMENT
-        # ----------------------------------------------------
+        # ====================================================
+        # SENTIMENT SECTION
+        # ====================================================
 
         if sentiments:
 
@@ -1623,13 +1859,11 @@ def main():
 
                 try:
 
-                    if (
-                        not sentiment.article_count
-                    ):
+                    if not sentiment.article_count:
 
                         continue
 
-                    score = (
+                    score = float(
                         sentiment.overall_score
                     )
 
@@ -1648,13 +1882,9 @@ def main():
                     lines.append(
 
                         f"{emoji} "
-
-                        f"{symbol.replace('.NS', '')}: "
-
+                        f"{str(symbol).replace('.NS', '')}: "
                         f"`{score:+.2f}` "
-
                         f"({sentiment.overall_label})"
-
                     )
 
                 except Exception:
@@ -1662,9 +1892,9 @@ def main():
                     continue
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # IPO WATCHLIST
-        # ----------------------------------------------------
+        # ====================================================
 
         try:
 
@@ -1681,9 +1911,9 @@ def main():
             )
 
 
-        # ----------------------------------------------------
-        # EXECUTION TIME
-        # ----------------------------------------------------
+        # ====================================================
+        # COMPLETION TIME
+        # ====================================================
 
         elapsed = int(
             (
@@ -1696,10 +1926,7 @@ def main():
 
             "",
 
-            (
-                f"_Completed in "
-                f"{elapsed}s_"
-            ),
+            f"_Completed in {elapsed}s_",
         ]
 
 
@@ -1708,21 +1935,25 @@ def main():
         # ====================================================
 
         send_telegram(
-            "\n".join(lines)
+            "\n".join(
+                lines
+            )
         )
 
-
-        # ====================================================
-        # COMPLETED
-        # ====================================================
-
-        logger.info("=" * 70)
 
         logger.info(
-            "PHASE 3 MORNING JOB COMPLETED"
+            "=" * 70
         )
 
-        logger.info("=" * 70)
+        logger.info(
+            "PHASE 3C MORNING JOB COMPLETED"
+        )
+
+        logger.info(
+            "=" * 70
+        )
+
+        return 0
 
 
     except Exception as error:
@@ -1735,18 +1966,22 @@ def main():
 
             send_telegram(
 
-                "❌ *Phase 3 Morning Job Failed*\n"
+                "❌ *Phase 3C Morning Job Failed*\n"
 
                 f"Date: `{today}`\n"
 
                 f"```{str(error)[:700]}```"
-
             )
 
         except Exception:
 
             pass
 
+        return 1
+
 
 if __name__ == "__main__":
-    main()
+
+    raise SystemExit(
+        main()
+    )
