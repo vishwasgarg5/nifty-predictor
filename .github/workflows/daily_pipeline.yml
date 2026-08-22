@@ -1,30 +1,70 @@
-name: Daily Market Prediction Pipeline
+name: Daily AI Stock Prediction Pipeline
 
 on:
 
-  workflow_dispatch:
-
   schedule:
 
-    # Runs Monday to Friday.
+    # Morning prediction job.
     #
-    # 03:30 UTC = 09:00 AM IST
-    #
-    # GitHub Actions cron always uses UTC.
-    - cron: "30 3 * * 1-5"
+    # GitHub Actions cron uses UTC.
+    # 02:30 UTC = 08:00 IST.
+    - cron: "30 2 * * 1-5"
+
+    # Prediction evaluation.
+    # 10:30 UTC = 16:00 IST.
+    - cron: "30 10 * * 1-5"
+
+    # Drift monitoring.
+    # 10:45 UTC = 16:15 IST.
+    - cron: "45 10 * * 1-5"
+
+    # Weekly model training.
+    # Sunday 04:30 UTC = 10:00 IST.
+    - cron: "30 4 * * 0"
+
+  workflow_dispatch:
+
+    inputs:
+
+      job:
+
+        description: "Select pipeline job"
+
+        required: true
+
+        default: "auto"
+
+        type: choice
+
+        options:
+          - auto
+          - morning
+          - evaluation
+          - drift
+          - training
 
 
 permissions:
+
   contents: write
+
+
+concurrency:
+
+  group: daily-stock-pipeline
+
+  cancel-in-progress: false
 
 
 jobs:
 
-  daily-pipeline:
+  pipeline:
+
+    name: Run AI Stock Prediction Pipeline
 
     runs-on: ubuntu-latest
 
-    timeout-minutes: 30
+    timeout-minutes: 60
 
 
     steps:
@@ -34,7 +74,11 @@ jobs:
       # ======================================================
 
       - name: Checkout repository
+
         uses: actions/checkout@v4
+
+        with:
+          fetch-depth: 0
 
 
       # ======================================================
@@ -42,6 +86,7 @@ jobs:
       # ======================================================
 
       - name: Set up Python
+
         uses: actions/setup-python@v5
 
         with:
@@ -49,15 +94,21 @@ jobs:
 
 
       # ======================================================
-      # DEPENDENCY CACHE
+      # CACHE DEPENDENCIES
       # ======================================================
 
-      - name: Cache Python dependencies
+      - name: Cache pip packages
+
         uses: actions/cache@v4
 
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+
+          key: >-
+            ${{ runner.os }}-pip-${{
+            hashFiles('requirements.txt')
+            }}
+
           restore-keys: |
             ${{ runner.os }}-pip-
 
@@ -67,6 +118,7 @@ jobs:
       # ======================================================
 
       - name: Install dependencies
+
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
@@ -76,71 +128,447 @@ jobs:
       # CREATE REQUIRED DIRECTORIES
       # ======================================================
 
-      - name: Create data directories
+      - name: Create project directories
+
         run: |
-          mkdir -p data/ledger
           mkdir -p data/models
-          mkdir -p data/monitoring
+          mkdir -p data/predictions
+          mkdir -p data/ledger
+          mkdir -p data/reports
+          mkdir -p logs
 
 
       # ======================================================
-      # MORNING PREDICTION PIPELINE
+      # DETERMINE JOB
       # ======================================================
 
-      - name: Run Morning Prediction Pipeline
+      - name: Determine pipeline job
+
+        id: job
+
         env:
+
+          INPUT_JOB: ${{ inputs.job }}
+
+        run: |
+
+          HOUR="$(date -u +%H)"
+
+          MINUTE="$(date -u +%M)"
+
+          WEEKDAY="$(date -u +%u)"
+
+          JOB="${INPUT_JOB:-auto}"
+
+
+          # --------------------------------------------------
+          # MANUAL JOB SELECTION
+          # --------------------------------------------------
+
+          if [ "$JOB" != "auto" ]; then
+
+            echo "job=$JOB" >> "$GITHUB_OUTPUT"
+
+            exit 0
+
+          fi
+
+
+          # --------------------------------------------------
+          # WEEKLY TRAINING
+          # --------------------------------------------------
+
+          if [ "$WEEKDAY" -eq 7 ]; then
+
+            echo "job=training" >> "$GITHUB_OUTPUT"
+
+            exit 0
+
+          fi
+
+
+          # --------------------------------------------------
+          # MORNING PREDICTIONS
+          # --------------------------------------------------
+
+          if [ "$HOUR" -eq 2 ]; then
+
+            echo "job=morning" >> "$GITHUB_OUTPUT"
+
+            exit 0
+
+          fi
+
+
+          # --------------------------------------------------
+          # EVALUATION
+          # --------------------------------------------------
+
+          if [ "$HOUR" -eq 10 ] && [ "$MINUTE" -lt 40 ]; then
+
+            echo "job=evaluation" >> "$GITHUB_OUTPUT"
+
+            exit 0
+
+          fi
+
+
+          # --------------------------------------------------
+          # DRIFT MONITORING
+          # --------------------------------------------------
+
+          if [ "$HOUR" -eq 10 ]; then
+
+            echo "job=drift" >> "$GITHUB_OUTPUT"
+
+            exit 0
+
+          fi
+
+
+          # --------------------------------------------------
+          # DEFAULT
+          # --------------------------------------------------
+
+          echo "job=morning" >> "$GITHUB_OUTPUT"
+
+
+      # ======================================================
+      # SHOW SELECTED JOB
+      # ======================================================
+
+      - name: Show selected job
+
+        run: |
+
+          echo "Selected job: ${{ steps.job.outputs.job }}"
+
+
+      # ======================================================
+      # VALIDATE CONFIG
+      # ======================================================
+
+      - name: Validate configuration
+
+        run: |
+
+          python - <<'PY'
+          from src.config import cfg
+
+
+          print("Configuration loaded successfully.")
+
+
+          registry = getattr(
+              cfg,
+              "model_registry",
+              None,
+          )
+
+
+          models = getattr(
+              cfg,
+              "models",
+              None,
+          )
+
+
+          print(
+              "Model registry:",
+              getattr(
+                  registry,
+                  "path",
+                  "NOT CONFIGURED",
+              ),
+          )
+
+
+          print(
+              "Require champion:",
+              getattr(
+                  models,
+                  "require_champion",
+                  False,
+              ),
+          )
+
+
+          print(
+              "Allow fallback:",
+              getattr(
+                  models,
+                  "allow_fallback_model",
+                  True,
+              ),
+          )
+          PY
+
+
+      # ======================================================
+      # CHECK MODEL REGISTRY
+      # ======================================================
+
+      - name: Check production model registry
+
+        run: |
+
+          if [ -f "src/model_registry.py" ]; then
+
+            python -m src.model_registry || true
+
+          else
+
+            echo "src/model_registry.py not found yet."
+
+          fi
+
+
+      # ======================================================
+      # MORNING PREDICTION JOB
+      # ======================================================
+
+      - name: Run morning prediction pipeline
+
+        if: steps.job.outputs.job == 'morning'
+
+        env:
+
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
         run: |
+
           python scripts/morning_job.py
 
 
       # ======================================================
-      # ACTUAL OUTCOME EVALUATION
+      # EVALUATION JOB
       # ======================================================
 
-      - name: Resolve Actual Market Outcomes
+      - name: Run prediction evaluation
+
+        if: steps.job.outputs.job == 'evaluation'
+
+        env:
+
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
         run: |
+
           python scripts/evaluation_job.py
 
 
       # ======================================================
-      # PRODUCTION MONITORING
+      # DRIFT MONITORING
       # ======================================================
 
-      - name: Run Production Monitoring
+      - name: Run drift monitoring
+
+        if: steps.job.outputs.job == 'drift'
+
+        env:
+
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
         run: |
-          python src/monitoring.py
+
+          python scripts/drift_job.py
 
 
       # ======================================================
-      # CHAMPION / CHALLENGER
+      # MODEL TRAINING
       # ======================================================
 
-      - name: Run Champion Challenger Evaluation
+      - name: Run model training
+
+        if: steps.job.outputs.job == 'training'
+
+        env:
+
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
         run: |
-          python scripts/champion_challenger_job.py
+
+          python scripts/train_models.py
 
 
       # ======================================================
-      # SAVE GENERATED DATA
+      # CHECK MODEL REGISTRY AFTER JOB
       # ======================================================
 
-      - name: Commit pipeline data
+      - name: Check updated model registry
+
+        if: always()
+
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add \
-            data/ledger/predictions.csv \
-            data/models \
-            data/monitoring \
+          if [ -f "src/model_registry.py" ]; then
+
+            python -m src.model_registry || true
+
+          else
+
+            echo "src/model_registry.py not found."
+
+          fi
+
+
+      # ======================================================
+      # SHOW GENERATED FILES
+      # ======================================================
+
+      - name: Show generated artifacts
+
+        if: always()
+
+        run: |
+
+          echo "========================================"
+
+          echo "MODELS"
+
+          echo "========================================"
+
+          find data/models \
+            -maxdepth 3 \
+            -type f \
             2>/dev/null || true
 
+
+          echo ""
+
+          echo "========================================"
+
+          echo "PREDICTIONS"
+
+          echo "========================================"
+
+          find data/predictions \
+            -maxdepth 2 \
+            -type f \
+            2>/dev/null || true
+
+
+          echo ""
+
+          echo "========================================"
+
+          echo "LEDGER"
+
+          echo "========================================"
+
+          find data/ledger \
+            -maxdepth 2 \
+            -type f \
+            2>/dev/null || true
+
+
+          echo ""
+
+          echo "========================================"
+
+          echo "REPORTS"
+
+          echo "========================================"
+
+          find data/reports \
+            -maxdepth 2 \
+            -type f \
+            2>/dev/null || true
+
+
+          echo ""
+
+          echo "========================================"
+
+          echo "LOGS"
+
+          echo "========================================"
+
+          find logs \
+            -maxdepth 2 \
+            -type f \
+            2>/dev/null || true
+
+
+      # ======================================================
+      # COMMIT PERSISTENT DATA
+      # ======================================================
+
+      - name: Commit pipeline artifacts
+
+        if: always()
+
+        run: |
+
+          git config \
+            user.name \
+            "github-actions[bot]"
+
+
+          git config \
+            user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+
+          git add \
+            data/models \
+            data/predictions \
+            data/ledger \
+            data/reports \
+            logs \
+            2>/dev/null || true
+
+
           if git diff --cached --quiet; then
-            echo "No generated data changes to commit."
-          else
-            git commit -m "Update market prediction pipeline data"
-            git push
+
+            echo "No changes to commit."
+
+            exit 0
+
           fi
+
+
+          git commit \
+            -m "chore: update pipeline artifacts [skip ci]"
+
+
+          git push
+
+
+      # ======================================================
+      # UPLOAD ARTIFACT BACKUP
+      # ======================================================
+
+      - name: Upload pipeline artifacts
+
+        if: always()
+
+        uses: actions/upload-artifact@v4
+
+        with:
+
+          name: pipeline-artifacts-${{ github.run_id }}
+
+          retention-days: 14
+
+          if-no-files-found: ignore
+
+          path: |
+
+            data/models/**
+
+            data/predictions/**
+
+            data/ledger/**
+
+            data/reports/**
+
+            logs/**
