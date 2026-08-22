@@ -17,24 +17,32 @@ Loading flow:
     Validate model path
           │
           ▼
-    Detect model format
+    Load serialized model
           │
           ▼
-    Load model
+    Unwrap training payload if necessary
           │
           ▼
-    Return production model
+    Return ProductionModel
 
 Supported formats:
 
+    .joblib
     .pkl
     .pickle
-    .joblib
 
-The loader uses:
+Supported saved structures:
 
-    joblib
-    pickle fallback
+    ProductionModel
+
+or:
+
+    {
+        "model": ProductionModel,
+        "metadata": {...},
+    }
+
+The second format is used by train_model.py.
 """
 
 from __future__ import annotations
@@ -50,10 +58,16 @@ from typing import Any
 # PROJECT ROOT
 # ============================================================
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(
+    __file__
+).resolve().parent.parent
 
 if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+
+    sys.path.insert(
+        0,
+        str(PROJECT_ROOT),
+    )
 
 
 # ============================================================
@@ -81,15 +95,19 @@ _MODEL_CACHE: dict[
 
 def load_model_file(
     model_path: str | Path,
+    use_cache: bool = True,
 ) -> Any:
     """
-    Load a serialized model.
+    Load a serialized model file.
 
     Supports:
 
         .joblib
         .pkl
         .pickle
+
+    Returns the raw object stored inside
+    the serialized file.
     """
 
     path = Path(
@@ -107,7 +125,14 @@ def load_model_file(
         path.resolve()
     )
 
-    if cache_key in _MODEL_CACHE:
+    # --------------------------------------------------------
+    # CACHE
+    # --------------------------------------------------------
+
+    if (
+        use_cache
+        and cache_key in _MODEL_CACHE
+    ):
 
         logger.info(
             "Using cached model: %s",
@@ -118,7 +143,15 @@ def load_model_file(
             cache_key
         ]
 
-    suffix = path.suffix.lower()
+    # --------------------------------------------------------
+    # FILE EXTENSION
+    # --------------------------------------------------------
+
+    suffix = (
+        path.suffix.lower()
+    )
+
+    model: Any = None
 
     # --------------------------------------------------------
     # JOBLIB
@@ -134,29 +167,25 @@ def load_model_file(
                 path
             )
 
-            _MODEL_CACHE[
-                cache_key
-            ] = model
-
-            logger.info(
-                "Loaded joblib model: %s",
-                path,
-            )
-
-            return model
-
         except ImportError as error:
 
             raise RuntimeError(
-                "joblib is required to load "
-                "this model."
+                "joblib is required to "
+                "load this model."
+            ) from error
+
+        except Exception as error:
+
+            raise RuntimeError(
+                "Could not load joblib model: "
+                f"{path}"
             ) from error
 
     # --------------------------------------------------------
     # PICKLE
     # --------------------------------------------------------
 
-    if suffix in {
+    elif suffix in {
         ".pkl",
         ".pickle",
     }:
@@ -174,6 +203,7 @@ def load_model_file(
         except Exception as pickle_error:
 
             # Try joblib as fallback.
+
             try:
 
                 import joblib
@@ -182,78 +212,150 @@ def load_model_file(
                     path
                 )
 
-            except Exception:
+            except Exception as joblib_error:
 
                 raise RuntimeError(
                     "Could not load model file: "
                     f"{path}"
-                ) from pickle_error
-
-        _MODEL_CACHE[
-            cache_key
-        ] = model
-
-        logger.info(
-            "Loaded pickle model: %s",
-            path,
-        )
-
-        return model
+                ) from joblib_error
 
     # --------------------------------------------------------
     # UNKNOWN FORMAT
     # --------------------------------------------------------
 
-    try:
+    else:
 
-        import joblib
+        # Try joblib first.
 
-        model = joblib.load(
-            path
-        )
+        try:
 
-        _MODEL_CACHE[
-            cache_key
-        ] = model
+            import joblib
 
-        logger.info(
-            "Loaded model using joblib fallback: %s",
-            path,
-        )
-
-        return model
-
-    except Exception:
-
-        pass
-
-    try:
-
-        with path.open(
-            "rb"
-        ) as file:
-
-            model = pickle.load(
-                file
+            model = joblib.load(
+                path
             )
 
+        except Exception:
+
+            model = None
+
+        # Try pickle.
+
+        if model is None:
+
+            try:
+
+                with path.open(
+                    "rb"
+                ) as file:
+
+                    model = pickle.load(
+                        file
+                    )
+
+            except Exception as error:
+
+                raise RuntimeError(
+                    "Unsupported or unreadable "
+                    f"model format: {path}"
+                ) from error
+
+    # --------------------------------------------------------
+    # CACHE RESULT
+    # --------------------------------------------------------
+
+    if use_cache:
+
         _MODEL_CACHE[
             cache_key
         ] = model
 
-        logger.info(
-            "Loaded model using pickle fallback: %s",
-            path,
-        )
+    logger.info(
+        "Loaded model file: %s",
+        path,
+    )
 
-        return model
+    return model
 
-    except Exception as error:
+
+# ============================================================
+# UNWRAP MODEL PAYLOAD
+# ============================================================
+
+def unwrap_model_payload(
+    loaded: Any,
+) -> tuple[
+    Any,
+    dict[str, Any],
+]:
+    """
+    Extract the actual model and saved metadata.
+
+    Supports either:
+
+        ProductionModel
+
+    or:
+
+        {
+            "model": ProductionModel,
+            "metadata": {...},
+        }
+    """
+
+    # --------------------------------------------------------
+    # TRAIN_MODEL.PY FORMAT
+    # --------------------------------------------------------
+
+    if isinstance(
+        loaded,
+        dict,
+    ):
+
+        if "model" in loaded:
+
+            model = loaded.get(
+                "model"
+            )
+
+            metadata = loaded.get(
+                "metadata",
+                {},
+            )
+
+            if not isinstance(
+                metadata,
+                dict,
+            ):
+
+                metadata = {}
+
+            if model is None:
+
+                raise RuntimeError(
+                    "Saved model payload contains "
+                    "no model."
+                )
+
+            return (
+                model,
+                dict(metadata),
+            )
+
+    # --------------------------------------------------------
+    # RAW MODEL FORMAT
+    # --------------------------------------------------------
+
+    if loaded is None:
 
         raise RuntimeError(
-            "Unsupported or unreadable "
-            f"model format: {path}"
-        ) from error
+            "Loaded model is None."
+        )
+
+    return (
+        loaded,
+        {},
+    )
 
 
 # ============================================================
@@ -262,9 +364,13 @@ def load_model_file(
 
 def load_champion_model(
     use_cache: bool = True,
-) -> tuple[Any, dict[str, Any]]:
+) -> tuple[
+    Any,
+    dict[str, Any],
+]:
     """
-    Load the currently registered production Champion.
+    Load the currently registered
+    production Champion.
 
     Returns:
 
@@ -277,21 +383,37 @@ def load_champion_model(
         get_champion_path,
     )
 
+    # --------------------------------------------------------
+    # GET CHAMPION
+    # --------------------------------------------------------
+
     champion = get_champion()
 
     if champion is None:
 
         raise RuntimeError(
-            "No production Champion is registered."
+            "No production Champion "
+            "is registered."
         )
 
-    model_path = get_champion_path()
+    # --------------------------------------------------------
+    # GET MODEL PATH
+    # --------------------------------------------------------
+
+    model_path = (
+        get_champion_path()
+    )
 
     if model_path is None:
 
         raise RuntimeError(
-            "Champion model path is missing."
+            "Champion model path "
+            "is missing."
         )
+
+    model_path = Path(
+        model_path
+    )
 
     if not model_path.exists():
 
@@ -300,51 +422,171 @@ def load_champion_model(
             f"{model_path}"
         )
 
-    cache_key = str(
-        model_path.resolve()
+    # --------------------------------------------------------
+    # LOAD FILE
+    # --------------------------------------------------------
+
+    loaded = load_model_file(
+        model_path=model_path,
+        use_cache=use_cache,
     )
 
-    if (
-        not use_cache
-        and cache_key in _MODEL_CACHE
+    # --------------------------------------------------------
+    # UNWRAP PAYLOAD
+    # --------------------------------------------------------
+
+    model, saved_metadata = (
+        unwrap_model_payload(
+            loaded
+        )
+    )
+
+    # --------------------------------------------------------
+    # VALIDATE MODEL
+    # --------------------------------------------------------
+
+    predict_function = getattr(
+        model,
+        "predict",
+        None,
+    )
+
+    if not callable(
+        predict_function
     ):
 
-        del _MODEL_CACHE[
-            cache_key
-        ]
+        raise RuntimeError(
+            "Loaded Champion does not "
+            "provide predict()."
+        )
 
-    model = load_model_file(
-        model_path
-    )
+    # --------------------------------------------------------
+    # REGISTRY METADATA
+    # --------------------------------------------------------
 
-    metadata = {
-        "role": "CHAMPION",
-        "name": champion.get(
-            "name"
-        ),
-        "model_path": str(
-            model_path
-        ),
-        "model_type": champion.get(
-            "model_type"
-        ),
-        "registered_at": champion.get(
-            "registered_at"
-        ),
-        "promoted_at": champion.get(
-            "promoted_at"
-        ),
-        "metadata": champion.get(
+    registry_metadata = (
+        champion.get(
             "metadata",
             {},
-        ),
-    }
+        )
+    )
+
+    if not isinstance(
+        registry_metadata,
+        dict,
+    ):
+
+        registry_metadata = {}
+
+    # --------------------------------------------------------
+    # COMBINE METADATA
+    # --------------------------------------------------------
+
+    metadata: dict[
+        str,
+        Any,
+    ] = {}
+
+    # Saved metadata comes first.
+
+    if isinstance(
+        saved_metadata,
+        dict,
+    ):
+
+        metadata.update(
+            saved_metadata
+        )
+
+    # Registry metadata is included separately.
+
+    metadata.update(
+        {
+            "model_source": "CHAMPION",
+
+            "role": "CHAMPION",
+
+            "name": champion.get(
+                "name"
+            ),
+
+            "model_path": str(
+                model_path
+            ),
+
+            "model_type": champion.get(
+                "model_type"
+            ),
+
+            "registered_at": champion.get(
+                "registered_at"
+            ),
+
+            "promoted_at": champion.get(
+                "promoted_at"
+            ),
+
+            "registry_metadata": (
+                registry_metadata
+            ),
+
+            "saved_metadata": (
+                saved_metadata
+            ),
+
+            "loaded": True,
+
+            "error": None,
+        }
+    )
+
+    # --------------------------------------------------------
+    # MODEL VERSION
+    # --------------------------------------------------------
+
+    if (
+        "model_version"
+        not in metadata
+    ):
+
+        model_version = getattr(
+            model,
+            "model_version",
+            None,
+        )
+
+        if model_version is not None:
+
+            metadata[
+                "model_version"
+            ] = model_version
+
+    # --------------------------------------------------------
+    # MODEL NAME
+    # --------------------------------------------------------
+
+    if (
+        "model_name"
+        not in metadata
+    ):
+
+        metadata[
+            "model_name"
+        ] = type(
+            model
+        ).__name__
 
     logger.info(
         "Production Champion loaded | "
-        "name=%s | path=%s",
-        metadata.get("name"),
+        "name=%s | path=%s | "
+        "type=%s",
+        metadata.get(
+            "name"
+        ),
         model_path,
+        type(
+            model
+        ).__name__,
     )
 
     return (
@@ -354,7 +596,7 @@ def load_champion_model(
 
 
 # ============================================================
-# SAFE LOADER
+# SAFE CHAMPION LOADER
 # ============================================================
 
 def try_load_champion_model() -> tuple[
@@ -362,11 +604,13 @@ def try_load_champion_model() -> tuple[
     dict[str, Any],
 ]:
     """
-    Safely attempt to load the Champion.
+    Safely attempt to load
+    the production Champion.
 
     Returns:
 
         model or None
+
         metadata/status
     """
 
@@ -376,8 +620,13 @@ def try_load_champion_model() -> tuple[
             load_champion_model()
         )
 
-        metadata["loaded"] = True
-        metadata["error"] = None
+        metadata[
+            "loaded"
+        ] = True
+
+        metadata[
+            "error"
+        ] = None
 
         return (
             model,
@@ -394,22 +643,60 @@ def try_load_champion_model() -> tuple[
         return (
             None,
             {
+                "model_source": "NONE",
+
                 "role": "CHAMPION",
+
                 "loaded": False,
-                "error": str(error),
+
+                "error": str(
+                    error
+                ),
             },
         )
 
 
 # ============================================================
-# CACHE
+# COMPATIBILITY ALIASES
+# ============================================================
+
+def load_production_model() -> tuple[
+    Any,
+    dict[str, Any],
+]:
+    """
+    Compatibility alias for
+    load_champion_model().
+    """
+
+    return load_champion_model()
+
+
+def load_active_model() -> tuple[
+    Any,
+    dict[str, Any],
+]:
+    """
+    Compatibility alias for
+    load_champion_model().
+    """
+
+    return load_champion_model()
+
+
+# ============================================================
+# CACHE MANAGEMENT
 # ============================================================
 
 def clear_model_cache() -> None:
     """
     Clear all cached models.
 
-    Useful after model promotion.
+    Call this after:
+
+        - promoting a new Champion
+        - replacing a model file
+        - retraining production models
     """
 
     _MODEL_CACHE.clear()
@@ -419,12 +706,22 @@ def clear_model_cache() -> None:
     )
 
 
+def get_cache_size() -> int:
+    """Return the number of cached models."""
+
+    return len(
+        _MODEL_CACHE
+    )
+
+
 # ============================================================
 # CLI TEST
 # ============================================================
 
 def main() -> int:
-    """Test Champion loading."""
+    """
+    Test Champion model loading.
+    """
 
     model, metadata = (
         try_load_champion_model()
@@ -432,28 +729,66 @@ def main() -> int:
 
     print()
 
-    print("=" * 70)
-
-    print("PRODUCTION MODEL LOADER")
-
-    print("=" * 70)
-
     print(
-        f"Loaded: {metadata.get('loaded')}"
+        "=" * 70
     )
 
     print(
-        f"Name: {metadata.get('name')}"
+        "PRODUCTION MODEL LOADER"
     )
 
     print(
-        f"Path: {metadata.get('model_path')}"
+        "=" * 70
     )
 
-    if metadata.get("error"):
+    print()
+
+    print(
+        "Loaded:",
+        metadata.get(
+            "loaded"
+        ),
+    )
+
+    print(
+        "Model source:",
+        metadata.get(
+            "model_source"
+        ),
+    )
+
+    print(
+        "Name:",
+        metadata.get(
+            "name"
+        ),
+    )
+
+    print(
+        "Path:",
+        metadata.get(
+            "model_path"
+        ),
+    )
+
+    print(
+        "Version:",
+        metadata.get(
+            "model_version"
+        ),
+    )
+
+    if metadata.get(
+        "error"
+    ):
+
+        print()
 
         print(
-            f"Error: {metadata.get('error')}"
+            "ERROR:",
+            metadata.get(
+                "error"
+            ),
         )
 
         return 1
@@ -461,8 +796,23 @@ def main() -> int:
     print()
 
     print(
-        "Model type: "
-        f"{type(model).__name__}"
+        "Model class:",
+        type(
+            model
+        ).__name__,
+    )
+
+    print()
+
+    print(
+        "Has predict():",
+        callable(
+            getattr(
+                model,
+                "predict",
+                None,
+            )
+        ),
     )
 
     return 0
