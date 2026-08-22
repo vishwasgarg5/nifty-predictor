@@ -1,11 +1,25 @@
-"""Parallel Champion / Challenger prediction engine.
+#!/usr/bin/env python3
 
-Runs the production Champion and active Challenger models against
-the same feature data and returns a combined prediction DataFrame.
+"""
+Champion / Challenger Parallel Prediction Engine.
 
-The engine is intentionally model-loader agnostic. It first tries
-to use the project's existing prediction pipeline and falls back to
-common sklearn/joblib/pickle model artifacts when possible.
+Responsibilities
+----------------
+1. Load the model registry.
+2. Identify the active Champion.
+3. Identify active Challenger models.
+4. Sort Challengers by newest first.
+5. Enforce max_active_challengers.
+6. Respect run_champion and run_challengers settings.
+7. Run all selected models against the same feature matrix.
+8. Return a normalized prediction DataFrame.
+9. Allow the existing production pipeline to provide a Champion
+   adapter when the Champion architecture is not a single model file.
+
+This module does not rank stocks, select Top 5 opportunities,
+or send Telegram messages.
+
+Those responsibilities remain in scripts/morning_job.py.
 """
 
 from __future__ import annotations
@@ -24,16 +38,11 @@ import numpy as np
 import pandas as pd
 
 
-logger = logging.getLogger(__name__)
-
-
 # ============================================================
 # PROJECT ROOT
 # ============================================================
 
-PROJECT_ROOT = Path(
-    __file__
-).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(
@@ -43,25 +52,59 @@ if str(PROJECT_ROOT) not in sys.path:
 
 
 # ============================================================
-# RESULT
+# LOGGING
+# ============================================================
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# CONSTANTS
+# ============================================================
+
+ACTIVE_CHALLENGER_STATUSES = {
+    "CHALLENGER",
+    "ACTIVE",
+    "EVALUATING",
+}
+
+INACTIVE_CHALLENGER_STATUSES = {
+    "REJECTED",
+    "RETIRED",
+    "FAILED",
+    "PROMOTED",
+    "ARCHIVED",
+    "DISABLED",
+}
+
+
+# ============================================================
+# RESULT MODEL
 # ============================================================
 
 @dataclass
 class ModelPredictionResult:
-    """Result of one model prediction run."""
+    """Result of a single model prediction."""
 
     model_name: str
+
     model_path: str | None
+
+    model_status: str
+
     success: bool
+
     predictions: pd.DataFrame
+
     error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        """Return a serializable summary."""
+        """Return a serializable result summary."""
 
         return {
             "model_name": self.model_name,
             "model_path": self.model_path,
+            "model_status": self.model_status,
             "success": self.success,
             "prediction_count": len(
                 self.predictions
@@ -71,31 +114,128 @@ class ModelPredictionResult:
 
 
 # ============================================================
+# PATH HELPERS
+# ============================================================
+
+def resolve_project_path(
+    value: str | Path,
+) -> Path:
+    """Resolve a path relative to the project root."""
+
+    path = Path(value)
+
+    if path.is_absolute():
+        return path
+
+    return PROJECT_ROOT / path
+
+
+# ============================================================
+# CONFIG HELPERS
+# ============================================================
+
+def load_parallel_settings() -> dict[str, Any]:
+    """
+    Load parallel prediction settings from src.config.cfg.
+
+    The engine can still run without configuration and falls back
+    to safe defaults.
+    """
+
+    defaults = {
+        "enabled": True,
+        "registry_path": (
+            "data/model_registry.json"
+        ),
+        "run_champion": True,
+        "run_challengers": True,
+        "champion_name": "current",
+        "max_active_challengers": 1,
+    }
+
+    try:
+
+        from src.config import cfg
+
+        section = getattr(
+            cfg,
+            "parallel_prediction",
+            None,
+        )
+
+        if section is None:
+            return defaults
+
+        if isinstance(section, dict):
+
+            defaults.update(
+                section
+            )
+
+            return defaults
+
+        if hasattr(section, "items"):
+
+            defaults.update(
+                dict(section.items())
+            )
+
+            return defaults
+
+        if hasattr(section, "__dict__"):
+
+            values = {
+                key: value
+                for key, value
+                in vars(section).items()
+                if not key.startswith("_")
+            }
+
+            defaults.update(
+                values
+            )
+
+    except Exception as error:
+
+        logger.debug(
+            "Unable to load parallel settings: %s",
+            error,
+        )
+
+    return defaults
+
+
+# ============================================================
 # REGISTRY
 # ============================================================
+
+def empty_registry() -> dict[str, Any]:
+    """Return an empty model registry."""
+
+    return {
+        "champion": None,
+        "challengers": [],
+        "history": [],
+    }
+
 
 def load_model_registry(
     registry_path: str | Path,
 ) -> dict[str, Any]:
     """Load the model registry safely."""
 
-    path = Path(registry_path)
-
-    if not path.is_absolute():
-        path = PROJECT_ROOT / path
+    path = resolve_project_path(
+        registry_path
+    )
 
     if not path.exists():
 
         logger.warning(
-            "Model registry not found: %s",
+            "Model registry does not exist: %s",
             path,
         )
 
-        return {
-            "champion": None,
-            "challengers": [],
-            "history": [],
-        }
+        return empty_registry()
 
     try:
 
@@ -114,8 +254,7 @@ def load_model_registry(
             dict,
         ):
             raise ValueError(
-                "Model registry must contain "
-                "a JSON object."
+                "Registry root must be an object."
             )
 
         registry.setdefault(
@@ -133,27 +272,75 @@ def load_model_registry(
             [],
         )
 
+        if not isinstance(
+            registry["challengers"],
+            list,
+        ):
+
+            logger.warning(
+                "Invalid challengers registry format."
+            )
+
+            registry["challengers"] = []
+
         return registry
 
     except Exception as error:
 
-        logger.error(
+        logger.exception(
             "Failed to load model registry: %s",
             error,
         )
 
-        return {
-            "champion": None,
-            "challengers": [],
-            "history": [],
-        }
+        return empty_registry()
 
+
+# ============================================================
+# TIMESTAMP HELPERS
+# ============================================================
+
+def parse_timestamp(
+    value: Any,
+) -> datetime:
+    """
+    Convert registry timestamps into datetime.
+
+    Invalid or missing timestamps become datetime.min so that
+    malformed entries naturally sort last.
+    """
+
+    if value is None:
+        return datetime.min
+
+    if isinstance(
+        value,
+        datetime,
+    ):
+        return value
+
+    try:
+
+        return datetime.fromisoformat(
+            str(value).replace(
+                "Z",
+                "+00:00",
+            )
+        )
+
+    except Exception:
+
+        return datetime.min
+
+
+# ============================================================
+# CHAMPION
+# ============================================================
 
 def get_active_champion(
     registry: dict[str, Any],
     default_name: str = "current",
 ) -> dict[str, Any]:
-    """Return the active Champion model definition."""
+    """Normalize the Champion registry entry."""
 
     champion = registry.get(
         "champion"
@@ -171,10 +358,16 @@ def get_active_champion(
                     default_name,
                 )
             ),
+
             "model_path": champion.get(
                 "model_path"
             ),
+
             "status": "CHAMPION",
+
+            "created_at": champion.get(
+                "created_at"
+            ),
         }
 
     if isinstance(
@@ -186,19 +379,31 @@ def get_active_champion(
             "model_name": champion,
             "model_path": None,
             "status": "CHAMPION",
+            "created_at": None,
         }
 
     return {
         "model_name": default_name,
         "model_path": None,
         "status": "CHAMPION",
+        "created_at": None,
     }
 
 
+# ============================================================
+# CHALLENGERS
+# ============================================================
+
 def get_active_challengers(
     registry: dict[str, Any],
+    max_active: int = 1,
 ) -> list[dict[str, Any]]:
-    """Return active challenger models."""
+    """
+    Return active Challengers.
+
+    Challengers are sorted newest-first using created_at.
+    Only max_active models are returned.
+    """
 
     challengers = registry.get(
         "challengers",
@@ -223,20 +428,6 @@ def get_active_challengers(
         ):
             continue
 
-        status = str(
-            challenger.get(
-                "status",
-                "",
-            )
-        ).upper()
-
-        if status not in (
-            "CHALLENGER",
-            "ACTIVE",
-            "EVALUATING",
-        ):
-            continue
-
         model_name = challenger.get(
             "model_name"
         )
@@ -244,40 +435,68 @@ def get_active_challengers(
         if not model_name:
             continue
 
+        status = str(
+            challenger.get(
+                "status",
+                "CHALLENGER",
+            )
+        ).upper()
+
+        if status in INACTIVE_CHALLENGER_STATUSES:
+            continue
+
+        if status not in ACTIVE_CHALLENGER_STATUSES:
+
+            continue
+
         active.append(
             {
                 "model_name": str(
                     model_name
                 ),
+
                 "model_path": challenger.get(
                     "model_path"
                 ),
+
                 "status": status,
+
                 "created_at": challenger.get(
                     "created_at"
                 ),
             }
         )
 
-    return active
+    active.sort(
+        key=lambda item: parse_timestamp(
+            item.get(
+                "created_at"
+            )
+        ),
+        reverse=True,
+    )
+
+    if max_active <= 0:
+        return []
+
+    return active[:max_active]
 
 
 # ============================================================
-# MODEL LOADING
+# MODEL PATH
 # ============================================================
 
 def resolve_model_path(
     model_path: str | Path | None,
 ) -> Path | None:
-    """Resolve a model path."""
+    """Resolve and validate a model artifact path."""
 
     if not model_path:
         return None
 
-    path = Path(model_path)
-
-    if not path.is_absolute():
-        path = PROJECT_ROOT / path
+    path = resolve_project_path(
+        model_path
+    )
 
     if not path.exists():
 
@@ -291,10 +510,21 @@ def resolve_model_path(
     return path
 
 
+# ============================================================
+# MODEL LOADING
+# ============================================================
+
 def load_serialized_model(
     model_path: str | Path,
 ) -> Any:
-    """Load joblib or pickle model artifacts."""
+    """
+    Load supported serialized model artifacts.
+
+    Supported:
+        .joblib
+        .pkl
+        .pickle
+    """
 
     path = Path(model_path)
 
@@ -313,7 +543,7 @@ def load_serialized_model(
         except Exception as error:
 
             raise RuntimeError(
-                f"Unable to load joblib model "
+                "Unable to load joblib model "
                 f"{path}: {error}"
             ) from error
 
@@ -336,7 +566,7 @@ def load_serialized_model(
         except Exception as error:
 
             raise RuntimeError(
-                f"Unable to load pickle model "
+                "Unable to load pickle model "
                 f"{path}: {error}"
             ) from error
 
@@ -353,44 +583,52 @@ def load_serialized_model(
 def prepare_feature_matrix(
     features: pd.DataFrame,
 ) -> tuple[pd.DataFrame, list[str]]:
-    """Prepare numeric feature matrix.
+    """
+    Convert the feature DataFrame into a numeric model matrix.
 
-    Non-numeric metadata columns are excluded automatically.
+    Metadata and known target columns are excluded.
     """
 
-    if features is None or features.empty:
+    if (
+        features is None
+        or features.empty
+    ):
         return (
             pd.DataFrame(),
             [],
         )
 
-    metadata_columns = {
+    excluded_columns = {
 
         "symbol",
         "ticker",
-        "date",
-        "market_date",
-        "prediction_date",
-        "created_at",
         "sector",
         "company",
         "name",
 
+        "date",
+        "market_date",
+        "prediction_date",
+        "created_at",
+
         "target",
+        "target_return",
+        "target_direction",
+
         "actual_return",
         "actual_direction",
         "actual_risk",
     }
 
-    available_columns = [
+    feature_columns = [
         column
         for column in features.columns
-        if column.lower()
-        not in metadata_columns
+        if str(column).lower()
+        not in excluded_columns
     ]
 
     matrix = features[
-        available_columns
+        feature_columns
     ].copy()
 
     matrix = matrix.apply(
@@ -412,7 +650,7 @@ def prepare_feature_matrix(
 
     return (
         matrix,
-        available_columns,
+        feature_columns,
     )
 
 
@@ -424,7 +662,7 @@ def normalize_predictions(
     raw_predictions: Any,
     row_count: int,
 ) -> np.ndarray:
-    """Normalize model output to one value per row."""
+    """Normalize arbitrary prediction output."""
 
     if isinstance(
         raw_predictions,
@@ -432,6 +670,7 @@ def normalize_predictions(
     ):
 
         if raw_predictions.empty:
+
             return np.full(
                 row_count,
                 np.nan,
@@ -474,9 +713,6 @@ def normalize_predictions(
 
         else:
 
-            # For multi-output classifiers, use the
-            # last column as the positive prediction.
-
             values = values[
                 :,
                 -1,
@@ -490,20 +726,24 @@ def normalize_predictions(
     if len(values) != row_count:
 
         raise ValueError(
-            "Prediction length mismatch: "
-            f"expected {row_count}, "
+            "Prediction length mismatch. "
+            f"Expected {row_count}, "
             f"received {len(values)}."
         )
 
     return values
 
 
+# ============================================================
+# DIRECTION PROBABILITY
+# ============================================================
+
 def calculate_direction_probability(
     model: Any,
     matrix: pd.DataFrame,
     predicted_return: np.ndarray,
 ) -> np.ndarray:
-    """Calculate probability of positive direction."""
+    """Return probability of positive direction."""
 
     if hasattr(
         model,
@@ -546,8 +786,6 @@ def calculate_direction_probability(
                 error,
             )
 
-    # Fallback conversion from predicted return.
-
     return np.where(
         predicted_return >= 0,
         0.60,
@@ -555,19 +793,33 @@ def calculate_direction_probability(
     )
 
 
+# ============================================================
+# RISK PREDICTION
+# ============================================================
+
 def calculate_risk_prediction(
     features: pd.DataFrame,
     row_count: int,
 ) -> np.ndarray:
-    """Create a fallback risk estimate from available features."""
+    """
+    Estimate risk from available feature columns.
+
+    Used as fallback when the serialized Challenger is not a
+    dedicated multi-output risk model.
+    """
 
     risk_columns = [
 
         "volatility",
+
         "atr",
+
         "atr_pct",
+
         "historical_volatility",
+
         "realized_volatility",
+
         "risk_score",
     ]
 
@@ -580,12 +832,15 @@ def calculate_risk_prediction(
                 errors="coerce",
             )
 
-            values = values.fillna(
-                values.median()
-            )
+            median = values.median()
+
+            if pd.isna(
+                median
+            ):
+                median = 0.0
 
             values = values.fillna(
-                0.0
+                median
             )
 
             return values.to_numpy(
@@ -607,6 +862,7 @@ def predict_with_model(
     model_path: str | Path | None,
     features: pd.DataFrame,
     prediction_date: str | None = None,
+    model_status: str = "CHALLENGER",
 ) -> ModelPredictionResult:
     """Run prediction using one serialized model."""
 
@@ -619,7 +875,7 @@ def predict_with_model(
         if path is None:
 
             raise FileNotFoundError(
-                f"No model path available for "
+                f"No usable model path for "
                 f"'{model_name}'."
             )
 
@@ -636,8 +892,7 @@ def predict_with_model(
         if matrix.empty:
 
             raise ValueError(
-                "No usable feature columns "
-                "were available."
+                "No usable numeric features."
             )
 
         if not hasattr(
@@ -647,13 +902,11 @@ def predict_with_model(
 
             raise TypeError(
                 f"Model '{model_name}' "
-                "does not expose predict()."
+                "does not implement predict()."
             )
 
-        raw_predictions = (
-            model.predict(
-                matrix
-            )
+        raw_predictions = model.predict(
+            matrix
         )
 
         predicted_return = (
@@ -686,18 +939,20 @@ def predict_with_model(
 
         result = pd.DataFrame(
             {
-                "model_name": model_name,
-
-                "model_path": str(
-                    path
-                ),
-
                 "prediction_date": (
                     prediction_date
                     or datetime.now()
                     .date()
                     .isoformat()
                 ),
+
+                "model_name": model_name,
+
+                "model_path": str(
+                    path
+                ),
+
+                "model_status": model_status,
 
                 "predicted_return": (
                     predicted_return
@@ -714,10 +969,17 @@ def predict_with_model(
                 "predicted_risk": (
                     predicted_risk
                 ),
+
+                "evaluation_status": (
+                    "PENDING"
+                ),
+
+                "created_at": (
+                    datetime.now()
+                    .isoformat()
+                ),
             }
         )
-
-        # Preserve useful identifiers.
 
         for column in (
             "symbol",
@@ -733,15 +995,6 @@ def predict_with_model(
                     .to_numpy()
                 )
 
-        result["evaluation_status"] = (
-            "PENDING"
-        )
-
-        result["created_at"] = (
-            datetime.now()
-            .isoformat()
-        )
-
         return ModelPredictionResult(
 
             model_name=model_name,
@@ -749,6 +1002,8 @@ def predict_with_model(
             model_path=str(
                 path
             ),
+
+            model_status=model_status,
 
             success=True,
 
@@ -774,6 +1029,8 @@ def predict_with_model(
                 else None
             ),
 
+            model_status=model_status,
+
             success=False,
 
             predictions=pd.DataFrame(),
@@ -783,59 +1040,125 @@ def predict_with_model(
 
 
 # ============================================================
-# PARALLEL PREDICTION ENGINE
+# CHAMPION ADAPTER
+# ============================================================
+
+def normalize_champion_output(
+    output: pd.DataFrame,
+    champion: dict[str, Any],
+    features: pd.DataFrame,
+    prediction_date: str | None,
+) -> pd.DataFrame:
+    """
+    Normalize predictions returned by the existing Champion pipeline.
+    """
+
+    if output is None:
+
+        return pd.DataFrame()
+
+    if not isinstance(
+        output,
+        pd.DataFrame,
+    ):
+
+        raise TypeError(
+            "champion_predictor must return "
+            "a pandas DataFrame."
+        )
+
+    if output.empty:
+
+        return pd.DataFrame()
+
+    result = output.copy()
+
+    result["model_name"] = (
+        champion["model_name"]
+    )
+
+    result["model_path"] = (
+        champion.get(
+            "model_path"
+        )
+    )
+
+    result["model_status"] = (
+        "CHAMPION"
+    )
+
+    result["prediction_date"] = (
+        prediction_date
+        or datetime.now()
+        .date()
+        .isoformat()
+    )
+
+    result["evaluation_status"] = (
+        "PENDING"
+    )
+
+    result["created_at"] = (
+        datetime.now()
+        .isoformat()
+    )
+
+    for column in (
+        "symbol",
+        "ticker",
+        "sector",
+    ):
+
+        if (
+            column in features.columns
+            and column not in result.columns
+        ):
+
+            result[column] = (
+                features[column]
+                .astype(str)
+                .to_numpy()
+            )
+
+    return result
+
+
+# ============================================================
+# PARALLEL ENGINE
 # ============================================================
 
 def run_parallel_predictions(
     features: pd.DataFrame,
-    registry_path: str | Path = (
-        "data/model_registry.json"
-    ),
+    registry_path: str | Path | None = None,
     champion_predictor: Callable[
         [pd.DataFrame],
         pd.DataFrame,
     ]
     | None = None,
     prediction_date: str | None = None,
+    settings: dict[str, Any] | None = None,
 ) -> tuple[
     pd.DataFrame,
     list[dict[str, Any]],
 ]:
-    """Run Champion and all active Challengers.
+    """
+    Run configured Champion and Challenger predictions.
 
-    Parameters
-    ----------
-    features:
-        Feature DataFrame containing at least symbol/ticker and
-        numeric model features.
-
-    registry_path:
-        Model registry JSON path.
-
-    champion_predictor:
-        Optional adapter for the existing production prediction
-        pipeline. This is useful when the Champion is not stored as
-        one simple pickle/joblib artifact.
-
-        It must return a DataFrame with at least:
-
-            predicted_return
-
-        Optional:
-
-            predicted_direction
-            direction_probability
-            predicted_risk
-
-    prediction_date:
-        Market date for the prediction.
+    The same feature DataFrame is supplied to every selected model.
 
     Returns
     -------
-    combined_predictions, summaries
+    predictions:
+        Combined normalized predictions.
+
+    summaries:
+        Per-model execution summaries.
     """
 
-    if features is None or features.empty:
+    if (
+        features is None
+        or features.empty
+    ):
 
         logger.warning(
             "No features supplied for "
@@ -847,216 +1170,298 @@ def run_parallel_predictions(
             [],
         )
 
+    configuration = (
+        load_parallel_settings()
+    )
+
+    if settings:
+
+        configuration.update(
+            settings
+        )
+
+    if not bool(
+        configuration.get(
+            "enabled",
+            True,
+        )
+    ):
+
+        logger.info(
+            "Parallel prediction is disabled."
+        )
+
+        return (
+            pd.DataFrame(),
+            [],
+        )
+
+    if registry_path is None:
+
+        registry_path = (
+            configuration.get(
+                "registry_path",
+                "data/model_registry.json",
+            )
+        )
+
     registry = load_model_registry(
         registry_path
     )
 
     champion = get_active_champion(
-        registry
+        registry,
+        default_name=str(
+            configuration.get(
+                "champion_name",
+                "current",
+            )
+        ),
+    )
+
+    max_active = int(
+        configuration.get(
+            "max_active_challengers",
+            1,
+        )
     )
 
     challengers = (
         get_active_challengers(
-            registry
+            registry=registry,
+            max_active=max_active,
         )
     )
 
-    summaries: list[
-        dict[str, Any]
-    ] = []
+    run_champion = bool(
+        configuration.get(
+            "run_champion",
+            True,
+        )
+    )
+
+    run_challengers = bool(
+        configuration.get(
+            "run_challengers",
+            True,
+        )
+    )
 
     prediction_frames: list[
         pd.DataFrame
+    ] = []
+
+    summaries: list[
+        dict[str, Any]
     ] = []
 
     # --------------------------------------------------------
     # CHAMPION
     # --------------------------------------------------------
 
-    if champion_predictor is not None:
+    if run_champion:
 
-        try:
+        if champion_predictor is not None:
 
-            champion_output = (
-                champion_predictor(
-                    features.copy()
-                )
-            )
+            try:
 
-            if not isinstance(
-                champion_output,
-                pd.DataFrame,
-            ):
-
-                raise TypeError(
-                    "champion_predictor must "
-                    "return a DataFrame."
+                champion_output = (
+                    champion_predictor(
+                        features.copy()
+                    )
                 )
 
-            result = champion_output.copy()
-
-            result["model_name"] = (
-                champion["model_name"]
-            )
-
-            result["model_path"] = (
-                champion.get(
-                    "model_path"
+                normalized = (
+                    normalize_champion_output(
+                        output=champion_output,
+                        champion=champion,
+                        features=features,
+                        prediction_date=prediction_date,
+                    )
                 )
-            )
 
-            result["prediction_date"] = (
-                prediction_date
-                or datetime.now()
-                .date()
-                .isoformat()
-            )
+                if not normalized.empty:
 
-            result["evaluation_status"] = (
-                "PENDING"
-            )
-
-            result["created_at"] = (
-                datetime.now()
-                .isoformat()
-            )
-
-            for column in (
-                "symbol",
-                "ticker",
-                "sector",
-            ):
-
-                if (
-                    column in features.columns
-                    and column
-                    not in result.columns
-                ):
-
-                    result[column] = (
-                        features[column]
-                        .astype(str)
-                        .to_numpy()
+                    prediction_frames.append(
+                        normalized
                     )
 
-            prediction_frames.append(
-                result
-            )
+                summaries.append(
+                    {
+                        "model_name": (
+                            champion[
+                                "model_name"
+                            ]
+                        ),
 
-            summaries.append(
-                {
-                    "model_name": (
-                        champion[
-                            "model_name"
-                        ]
-                    ),
-                    "model_path": (
-                        champion.get(
-                            "model_path"
-                        )
-                    ),
-                    "success": True,
-                    "prediction_count": len(
-                        result
-                    ),
-                    "error": None,
-                }
-            )
+                        "model_path": (
+                            champion.get(
+                                "model_path"
+                            )
+                        ),
 
-        except Exception as error:
+                        "model_status": (
+                            "CHAMPION"
+                        ),
 
-            logger.exception(
-                "Champion adapter prediction failed."
-            )
+                        "success": True,
 
-            summaries.append(
-                {
-                    "model_name": (
-                        champion[
-                            "model_name"
-                        ]
-                    ),
-                    "model_path": (
-                        champion.get(
-                            "model_path"
-                        )
-                    ),
-                    "success": False,
-                    "prediction_count": 0,
-                    "error": str(error),
-                }
-            )
+                        "prediction_count": len(
+                            normalized
+                        ),
 
-    else:
+                        "error": None,
+                    }
+                )
 
-        champion_result = (
-            predict_with_model(
+            except Exception as error:
+
+                logger.exception(
+                    "Champion prediction failed."
+                )
+
+                summaries.append(
+                    {
+                        "model_name": (
+                            champion[
+                                "model_name"
+                            ]
+                        ),
+
+                        "model_path": (
+                            champion.get(
+                                "model_path"
+                            )
+                        ),
+
+                        "model_status": (
+                            "CHAMPION"
+                        ),
+
+                        "success": False,
+
+                        "prediction_count": 0,
+
+                        "error": str(error),
+                    }
+                )
+
+        elif champion.get(
+            "model_path"
+        ):
+
+            result = predict_with_model(
+
                 model_name=(
                     champion[
                         "model_name"
                     ]
                 ),
+
                 model_path=(
                     champion.get(
                         "model_path"
                     )
                 ),
+
                 features=features,
+
                 prediction_date=prediction_date,
+
+                model_status="CHAMPION",
             )
-        )
 
-        summaries.append(
-            champion_result.to_dict()
-        )
+            summaries.append(
+                result.to_dict()
+            )
 
-        if champion_result.success:
+            if result.success:
 
-            prediction_frames.append(
-                champion_result.predictions
+                prediction_frames.append(
+                    result.predictions
+                )
+
+        else:
+
+            summaries.append(
+                {
+                    "model_name": (
+                        champion[
+                            "model_name"
+                        ]
+                    ),
+
+                    "model_path": None,
+
+                    "model_status": (
+                        "CHAMPION"
+                    ),
+
+                    "success": False,
+
+                    "prediction_count": 0,
+
+                    "error": (
+                        "Champion enabled but no "
+                        "predictor or model path "
+                        "is available."
+                    ),
+                }
             )
 
     # --------------------------------------------------------
     # CHALLENGERS
     # --------------------------------------------------------
 
-    for challenger in challengers:
+    if run_challengers:
 
-        challenger_result = (
-            predict_with_model(
+        if not challengers:
+
+            logger.info(
+                "No active Challengers found."
+            )
+
+        for challenger in challengers:
+
+            result = predict_with_model(
+
                 model_name=(
                     challenger[
                         "model_name"
                     ]
                 ),
+
                 model_path=(
                     challenger.get(
                         "model_path"
                     )
                 ),
+
                 features=features,
+
                 prediction_date=prediction_date,
+
+                model_status="CHALLENGER",
             )
-        )
 
-        summaries.append(
-            challenger_result.to_dict()
-        )
-
-        if challenger_result.success:
-
-            prediction_frames.append(
-                challenger_result.predictions
+            summaries.append(
+                result.to_dict()
             )
+
+            if result.success:
+
+                prediction_frames.append(
+                    result.predictions
+                )
 
     # --------------------------------------------------------
-    # COMBINE
+    # COMBINE RESULTS
     # --------------------------------------------------------
 
     if not prediction_frames:
 
-        logger.error(
-            "All model predictions failed."
+        logger.warning(
+            "No parallel predictions were generated."
         )
 
         return (
@@ -1082,6 +1487,8 @@ def run_parallel_predictions(
 
         "model_name",
 
+        "model_status",
+
         "model_path",
 
         "predicted_return",
@@ -1106,14 +1513,25 @@ def run_parallel_predictions(
     remaining_columns = [
         column
         for column in combined.columns
-        if column
-        not in ordered_columns
+        if column not in ordered_columns
     ]
 
     combined = combined[
         ordered_columns
         + remaining_columns
     ]
+
+    logger.info(
+        "Parallel prediction complete. "
+        "Rows=%s Models=%s",
+        len(combined),
+        combined[
+            "model_name"
+        ].nunique()
+        if "model_name"
+        in combined.columns
+        else 0,
+    )
 
     return (
         combined,
@@ -1129,20 +1547,26 @@ def append_parallel_predictions(
     predictions: pd.DataFrame,
     ledger_path: str | Path,
 ) -> Path:
-    """Append predictions to the prediction ledger."""
+    """
+    Append normalized parallel predictions to a CSV ledger.
 
-    if predictions is None or predictions.empty:
+    This helper is optional because projects may already have their
+    own prediction ledger implementation.
+    """
+
+    if (
+        predictions is None
+        or predictions.empty
+    ):
 
         raise ValueError(
-            "No predictions available to append."
+            "No predictions available "
+            "to append."
         )
 
-    path = Path(
+    path = resolve_project_path(
         ledger_path
     )
-
-    if not path.is_absolute():
-        path = PROJECT_ROOT / path
 
     path.parent.mkdir(
         parents=True,
